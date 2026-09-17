@@ -1,4 +1,7 @@
-"""Right-hand panel: the four rekordbox My Tag columns with their values as checkboxes.
+"""Right-hand panel: the four tag columns with their values as checkboxes.
+
+They are rekordbox's My Tag columns when rekordbox is on, and local ones (config.LOCAL_COLUMN_PREFIX)
+when it is off — same panel either way, so only the wording about syncing changes.
 
 Tag mode: ticking a value applies it to every selected track (a partial tick means some of them have it).
 Filter mode: clicking a value cycles must have → exclude → off, and the list is filtered instead.
@@ -80,6 +83,7 @@ class TagPanel(QWidget):
                 item.widget().deleteLater()
         self.boxes, self.names = {}, {}
         columns = self.library.cache.columns()
+        local = not self.library.rekordbox_enabled
         if not columns:
             msg = self.library.rb_error or "No rekordbox My Tag columns found."
             label = QLabel(f"Tags unavailable.\n\n{msg}")
@@ -97,7 +101,7 @@ class TagPanel(QWidget):
             header = QHBoxLayout()
             title = QLabel(f"<b>{column['name']}</b>")
             rename = QToolButton(text="✎")
-            rename.setToolTip("Rename this My Tag column")
+            rename.setToolTip("Rename this column" if local else "Rename this My Tag column")
             rename.clicked.connect(lambda _=False, c=column: self._rename_column(c))
             add = QToolButton(text="+")
             add.setToolTip(f"New tag in {column['name']}")
@@ -107,9 +111,11 @@ class TagPanel(QWidget):
             header.addWidget(add)
             v_layout.addLayout(header)
             for value in (v for v in values if v["column_rb_id"] == column["rb_id"]):
-                self.names[value["id"]] = value["name"] + ("  •" if value["rb_id"] is None or value["dirty"] else "")
+                # The • means "rekordbox hasn't got this yet". With rekordbox off nothing is waiting on it.
+                unsynced = not local and (value["rb_id"] is None or value["dirty"])
+                self.names[value["id"]] = value["name"] + ("  •" if unsynced else "")
                 cb = QCheckBox()
-                cb.setToolTip("• = not synced to rekordbox yet" if value["rb_id"] is None or value["dirty"] else "")
+                cb.setToolTip("• = not synced to rekordbox yet" if unsynced else "")
                 cb.setContextMenuPolicy(Qt.CustomContextMenu)
                 cb.customContextMenuRequested.connect(lambda _pos, v=value, w=cb: self._value_menu(v, w))
                 cb.clicked.connect(lambda _checked, vid=value["id"]: self._clicked(vid))
@@ -209,7 +215,8 @@ class TagPanel(QWidget):
         return name if ok and name else None
 
     def _rename_column(self, column):
-        name = self._ask("Rename column", "Column name (as shown in rekordbox My Tag):", column["name"])
+        label = "Column name:" if not self.library.rekordbox_enabled else "Column name (as shown in rekordbox My Tag):"
+        name = self._ask("Rename column", label, column["name"])
         if name and name != column["name"]:
             self.library.cache.rename_column(column["rb_id"], name)
             self.definitions_edited.emit()
@@ -243,8 +250,9 @@ class TagPanel(QWidget):
             answer = QMessageBox.question(
                 self,
                 "Delete tag",
-                f"Delete “{value['name']}” and remove it from every track?\n"
-                f"rekordbox is updated at the next sync.{note}",
+                f"Delete “{value['name']}” and remove it from every track?"
+                + (f"\nrekordbox is updated at the next sync." if self.library.rekordbox_enabled else "")
+                + note,
             )
             if answer == QMessageBox.Yes:
                 self.library.cache.delete_value(value["id"])

@@ -121,6 +121,10 @@ class Library:
         self.cache = Cache(CACHE_PATH)
         self.rb_state = None
         self.rb_error = None
+        if not settings.rekordbox_enabled:
+            # Before any load: with no library folder chosen yet there is no reload() to seed them,
+            # and the tag panel would open empty on a fresh install without rekordbox.
+            self.cache.ensure_local_columns(SUGGESTED_COLUMNS)
         self._health_inputs = None  # (proposals, empty folders): only files changing can change them
         # Undo steps. A step is a list of ("tag", value_id, on, paths that actually changed)
         # ("link", path, path, note, created, on) and ("note", path, path, old note, new note) entries.
@@ -132,19 +136,36 @@ class Library:
 
     # --- rekordbox ---------------------------------------------------------------------------------
 
+    @property
+    def rekordbox_enabled(self):
+        return self.settings.rekordbox_enabled
+
     def load_rekordbox_state(self):
-        """Read master.db. Safe while rekordbox is open."""
+        """Read master.db. Safe while rekordbox is open.
+
+        Returns (None, None) when rekordbox is switched off — no state, but no error either: everything
+        downstream already treats a missing state as "tags stay local", and the UI tells the two apart
+        by asking the setting rather than by the error being blank.
+        """
+        if not self.rekordbox_enabled:
+            return None, None
         try:
             return rekordbox.read_state(self.settings.rekordbox_db), None
         except rekordbox.RekordboxError as exc:
             return None, str(exc)
 
     def apply_rekordbox_state(self, state, error):
+        """Returns (adopted, orphaned) local columns, for the caller to report. See Cache.adopt_local_columns."""
         self.rb_state, self.rb_error = state, error
         if state is None:
-            return
+            if self.rekordbox_enabled:
+                return [], []  # unreadable, not switched off: don't invent columns over a transient failure
+            self.cache.ensure_local_columns(SUGGESTED_COLUMNS)
+            return [], []
+        adopted, orphans = self.cache.adopt_local_columns(state)
         self.cache.import_rekordbox(state)
         self._suggest_columns_once()
+        return adopted, orphans
 
     def _suggest_columns_once(self):
         """First run: rename rekordbox's default My Tag columns to Genre / Mood / Set position / Favorite.

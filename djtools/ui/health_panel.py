@@ -47,7 +47,8 @@ class HealthPanel(QWidget):
         self.progress.setFormat(f"{report.complete} / {report.total} tracks complete")
         self.progress.setToolTip(
             "A track is complete when it has an artist, a title and a clean name, is imported and analyzed in "
-            "rekordbox, and has a Genre tag."
+            "rekordbox, and has a Genre tag." if report.rekordbox else
+            "A track is complete when it has an artist, a title and a clean name, and has a Genre tag."
         )
         self.list.clear()
         # Required checks first, then the warnings that have something to show.

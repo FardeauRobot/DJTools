@@ -16,6 +16,10 @@ BACKUPS_KEPT = 20
 SUGGESTED_COLUMNS = ["Genre", "Mood", "Set position", "Favorite"]
 FAVORITE = "Favorite"
 
+# Tag columns invented here, for a library with no rekordbox behind it. rekordbox's own ids are digits,
+# so the prefix can never collide; `Cache.adopt_local_columns` trades these in for the real ones.
+LOCAL_COLUMN_PREFIX = "local:"
+
 
 class Settings:
     def __init__(self):
@@ -51,3 +55,23 @@ class Settings:
         # DJTOOLS_RB_DB points the app at a copy of master.db for testing.
         override = os.environ.get("DJTOOLS_RB_DB") or self._data.get("rekordbox_db")
         return Path(override) if override else DEFAULT_RB_DB
+
+    @property
+    def rekordbox_enabled(self) -> bool:
+        """Whether DJTools opens master.db at all. Off means tags stay here and nothing syncs.
+
+        Unset on a fresh install, so the first run answers it by looking: someone without rekordbox gets
+        a working app instead of a permanent error. DJTOOLS_RB_DB is an explicit "use this database",
+        so it wins over a stored off — otherwise the testing recipe would silently do nothing.
+        """
+        if os.environ.get("DJTOOLS_RB_DB"):
+            return True
+        value = self._data.get("rekordbox_enabled")
+        if value is None:
+            value = self.rekordbox_db.exists()
+            self.set("rekordbox_enabled", value)
+        return bool(value)
+
+    @rekordbox_enabled.setter
+    def rekordbox_enabled(self, value):
+        self.set("rekordbox_enabled", bool(value))

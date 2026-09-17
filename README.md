@@ -7,7 +7,22 @@ Browse, play, tag and organise a DJ library; tags are written into rekordbox as 
 ```
 
 No setup step: `run.sh` creates `.venv` on the first run (any Python 3.10+ on `PATH`) and reinstalls
-whenever `requirements.txt` changes. It needs rekordbox 6 on this Mac, with the library already analyzed.
+whenever `requirements.txt` changes.
+
+## rekordbox is optional
+
+**Library → Sync tags with rekordbox** turns the whole rekordbox side on or off. The first run decides by
+looking for `~/Library/Pioneer/rekordbox/master.db`, and the setting is remembered from then on.
+
+**Off**, DJTools never opens rekordbox's database. Browsing, playing, search, the BPM and key filters,
+links, Clean up names and Library health all work; BPM and key come from the file tags instead of
+rekordbox's analysis. Tagging works too — the four columns are DJTools' own, and the Sync button, the
+rekordbox column and the "not synced" dots are hidden, because nothing is waiting to be sent anywhere.
+
+**Turning it back on** hands those columns over to rekordbox's four My Tag columns, pairing them by
+position, and the app says which became which. Everything tagged offline is then queued for the next
+sync — nothing is re-done and nothing is lost. `DJTOOLS_RB_DB` implies rekordbox is wanted, so it
+overrides a stored off.
 
 ## How it fits with rekordbox
 

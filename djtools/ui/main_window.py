@@ -350,10 +350,10 @@ class MainWindow(QMainWindow):
         self._build_menus()
         self._restore_layout()
 
-        self.rb_running = rekordbox.is_running()
+        self.rb_running = rekordbox.is_running() if self.library.rekordbox_enabled else False
         self.rb_timer = QTimer(self)
         self.rb_timer.timeout.connect(self._poll_rekordbox)
-        self.rb_timer.start(3000)
+        self._apply_rekordbox_mode()
 
         if self.library.root and os.path.isdir(self.library.root):
             self._set_tree_root()
@@ -386,7 +386,9 @@ class MainWindow(QMainWindow):
         self.sync_action.setEnabled(False)
         self.progress.setRange(0, 0)
         self.progress.show()
-        self.statusBar().showMessage("Scanning library and reading rekordbox…")
+        self.statusBar().showMessage(
+            "Scanning library and reading rekordbox…" if self.library.rekordbox_enabled else "Scanning library…"
+        )
         self.worker = LoadWorker(self.library)
         self.worker.progress.connect(self._scan_progress)
         self.worker.done.connect(self._loaded)
@@ -397,17 +399,38 @@ class MainWindow(QMainWindow):
         self.progress.setValue(i)
 
     def _loaded(self, state, error, count):
-        self.library.apply_rekordbox_state(state, error)
+        adopted, orphans = self.library.apply_rekordbox_state(state, error)
         self.progress.hide()
         self.rescan_action.setEnabled(True)
         self._rebuild()
         missing = sum(1 for r in self.model.rows if not r.in_rekordbox)
         msg = f"{count} tracks."
-        if error:
+        if not self.library.rekordbox_enabled:
+            msg += " rekordbox is off: tags stay in DJTools (Library → Sync tags with rekordbox)."
+        elif error:
             msg += f" rekordbox: {error}"
         elif missing:
             msg += f" {missing} not in rekordbox yet: import and analyze them there, then Rescan."
         self.statusBar().showMessage(msg, 15000)
+        if adopted or orphans:
+            self._report_adoption(adopted, orphans)
+
+    def _report_adoption(self, adopted, orphans):
+        """Say what became of the columns tagged while rekordbox was off. They changed identity silently
+        otherwise, and the user is about to sync tags they made before rekordbox was in the picture."""
+        lines = [f"• {local} → rekordbox's “{rb}”" for local, rb in adopted]
+        text = (
+            "The tags you made with rekordbox off now belong to its My Tag columns:\n\n"
+            + "\n".join(lines)
+            + "\n\nSync to rekordbox renames those columns and sends the tags."
+        ) if adopted else ""
+        if orphans:
+            text += (
+                ("\n\n" if text else "")
+                + "rekordbox had no column left for: " + ", ".join(orphans)
+                + ".\nThose tags stay in DJTools and are never synced."
+            )
+        QMessageBox.information(self, "Tags made without rekordbox", text)
 
     def _rebuild(self):
         self.library.clear_undo()  # paths or tag definitions may have changed under the recorded steps
@@ -441,13 +464,45 @@ class MainWindow(QMainWindow):
             self.rb_running = running
             self._update_status()
 
+    # --- rekordbox on or off ---------------------------------------------------------------------
+
+    def _apply_rekordbox_mode(self):
+        """Show or hide everything that only means something with rekordbox behind the app."""
+        on = self.library.rekordbox_enabled
+        self.sync_action.setVisible(on)
+        self.table.setColumnHidden(RB, not on)  # after _restore_layout: the saved state may disagree
+        if on:
+            if not self.rb_timer.isActive():
+                self.rb_timer.start(3000)  # a pgrep every 3s, pointless when nothing can be synced
+        else:
+            self.rb_timer.stop()
+            self.rb_running = False
+        if hasattr(self, "rb_enabled_action"):
+            self.rb_enabled_action.setChecked(on)
+
+    def _toggle_rekordbox(self, on):
+        if not on:
+            changes, _waiting = self.library.pending_counts()
+            if changes and QMessageBox.question(
+                self, "Turn rekordbox off",
+                f"{changes} change{'s' * (changes != 1)} haven't been synced yet.\n\n"
+                "They stay here and are sent when you turn rekordbox back on. Nothing is lost.\n\nTurn it off?",
+            ) != QMessageBox.Yes:
+                self.rb_enabled_action.setChecked(True)
+                return
+        self.library.settings.rekordbox_enabled = on
+        self._apply_rekordbox_mode()
+        self.reload()  # off: drops the state. On: full read, so columns are adopted and tags line up.
+
     def _update_status(self):
         changes, waiting = self.library.pending_counts()
         running = self.rb_running
         self.sync_action.setText(f"⇪ Sync to rekordbox ({changes})" if changes else "⇪ Sync to rekordbox")
         self.sync_action.setEnabled(bool(changes) and self.library.rb_state is not None)
         parts = []
-        if self.library.rb_error:
+        if not self.library.rekordbox_enabled:
+            parts.append("rekordbox off · tags stay in DJTools")
+        elif self.library.rb_error:
             parts.append(f"<span style='color:{theme.TODO.name()}'>rekordbox unreadable</span>")
         else:
             parts.append("rekordbox open: quit it to sync" if running else "rekordbox closed")
@@ -571,8 +626,9 @@ class MainWindow(QMainWindow):
         if dialog.applied or dialog.errors:
             self._rebuild()
             self.statusBar().showMessage(
-                f"Cleaned up {dialog.applied} track{'s' * (dialog.applied != 1)}. Renamed files reach rekordbox at "
-                "the next Sync; use Reload Tag in rekordbox to refresh titles.", 15000
+                f"Cleaned up {dialog.applied} track{'s' * (dialog.applied != 1)}."
+                + (" Renamed files reach rekordbox at the next Sync; use Reload Tag in rekordbox to refresh titles."
+                   if self.library.rekordbox_enabled else ""), 15000
             )
 
     # --- playback / favorites --------------------------------------------------------------------
@@ -592,7 +648,8 @@ class MainWindow(QMainWindow):
         paths = paths or self._selected_paths()
         if not paths:
             return
-        if self.library.rb_state is None:
+        # With rekordbox off there is no state either, but the tag columns are local and perfectly usable.
+        if self.library.rb_state is None and self.library.rekordbox_enabled:
             QMessageBox.warning(self, "Favorites", "rekordbox's database couldn't be read, so tags are unavailable.")
             return
         fav = self._favorite_id(create=True)
@@ -1086,6 +1143,16 @@ class MainWindow(QMainWindow):
         self._action(lib, "Clean up names…", self.open_cleanup)
         self._action(lib, "New folder…", lambda: self.new_folder(self._current_folder()), "m_new_folder")
         lib.addSeparator()
+        self.rb_enabled_action = QAction("Sync tags with rekordbox", self, checkable=True)
+        self.rb_enabled_action.setChecked(self.library.rekordbox_enabled)
+        self.rb_enabled_action.setToolTip(
+            "Off: DJTools never opens rekordbox's database. Tags, links and everything else keep working here."
+        )
+        if os.environ.get("DJTOOLS_RB_DB"):
+            self.rb_enabled_action.setEnabled(False)
+            self.rb_enabled_action.setToolTip("DJTOOLS_RB_DB is set, which asks for a specific database.")
+        self.rb_enabled_action.triggered.connect(self._toggle_rekordbox)
+        lib.addAction(self.rb_enabled_action)
         lib.addAction(self.sync_action)
 
         edit = bar.addMenu("Edit")
@@ -1129,7 +1196,7 @@ class MainWindow(QMainWindow):
     def _fill_column_menu(self, menu):
         menu.clear()
         for col, name in enumerate(HEADERS):
-            if col == TITLE:
+            if col == TITLE or (col == RB and not self.library.rekordbox_enabled):
                 continue
             action = menu.addAction("★ Favorite" if col == FAV else name)
             action.setCheckable(True)

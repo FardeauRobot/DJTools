@@ -1,6 +1,7 @@
 """Local SQLite store: scanned file metadata plus the working copy of tags and pending rekordbox changes."""
 import sqlite3
 
+from .config import LOCAL_COLUMN_PREFIX
 from .rekordbox import norm
 
 SCHEMA = """
@@ -186,6 +187,47 @@ class Cache:
                 )
 
     # --- rekordbox reconciliation ------------------------------------------------------------------
+
+    def ensure_local_columns(self, names):
+        """Tag columns for a library running without rekordbox.
+
+        Only when nothing defines them yet: a cache that has seen rekordbox keeps its real columns while
+        the setting is off, so turning it back on resumes rather than starts over. Created dirty, so the
+        names reach rekordbox as renames once there is a rekordbox to send them to.
+        """
+        if self.columns():
+            return False
+        self.db.executemany(
+            "INSERT INTO tag_columns (rb_id, name, position, dirty) VALUES (?,?,?,1)",
+            [(f"{LOCAL_COLUMN_PREFIX}{i}", name, i) for i, name in enumerate(names)],
+        )
+        self.db.commit()
+        return True
+
+    def adopt_local_columns(self, state):
+        """Hand local columns (and their tags) over to rekordbox's real ones, pairing by position.
+
+        rekordbox offers four fixed My Tag columns, so position is the only pairing there is. This must
+        run before `import_rekordbox`: that deletes every column rekordbox doesn't list, and without the
+        adoption a library tagged offline would lose its columns and `sync()` would skip the tags under
+        them (`parent_id not in tags`) without saying a word.
+
+        Returns (adopted, orphans): orphans are local columns rekordbox had none left to pair with, whose
+        tags cannot be synced — the caller is expected to say so out loud.
+        """
+        local = [c for c in self.columns() if str(c["rb_id"]).startswith(LOCAL_COLUMN_PREFIX)]
+        if not local:
+            return [], []
+        taken = {c["rb_id"] for c in self.columns()}
+        free = [(rb_id, name) for rb_id, name in state.columns if rb_id not in taken]
+        adopted = []
+        for column, (rb_id, rb_name) in zip(local, free):
+            # Values move first: column_rb_id still points at the old id until the column row changes.
+            self.db.execute("UPDATE tag_values SET column_rb_id=? WHERE column_rb_id=?", (rb_id, column["rb_id"]))
+            self.db.execute("UPDATE tag_columns SET rb_id=? WHERE rb_id=?", (rb_id, column["rb_id"]))
+            adopted.append((column["name"], rb_name))
+        self.db.commit()
+        return adopted, [c["name"] for c in local[len(free):]]
 
     def import_rekordbox(self, state):
         """Bring rekordbox's tags in, without overwriting anything edited here and not yet synced."""

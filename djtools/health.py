@@ -36,6 +36,7 @@ class Report:
     checks: list = field(default_factory=list)
     total: int = 0
     complete: int = 0
+    rekordbox: bool = True  # whether the rekordbox checks are part of "complete"
 
 
 def _nfc_lower(text):
@@ -195,4 +196,7 @@ def run(rows, proposals, empty, root, columns, values, rekordbox_readable):
     failing = set()
     for c in required:
         failing.update(c.paths)
-    return Report(checks=checks, total=len(rows), complete=sum(1 for r in rows if r.path not in failing))
+    return Report(
+        checks=checks, total=len(rows), complete=sum(1 for r in rows if r.path not in failing),
+        rekordbox=rekordbox_readable,
+    )
