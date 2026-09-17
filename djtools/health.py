@@ -121,8 +121,8 @@ def run(rows, proposals, empty, root, columns, values, rekordbox_readable):
                 "Tracks without a Genre can't be found when you filter by style while preparing a set. One or two "
                 "genres per track is enough; select several tracks and tick a genre to tag them all at once."
                 if is_genre else
-                f"Optional. Tracks with no “{name}” My Tag. Filling it in makes filtering easier while you prepare "
-                "a set; it's fine to leave it for later."
+                f"Optional. Tracks with no “{name}” {'My Tag' if rekordbox_readable else 'tag'}. Filling it in makes "
+                "filtering easier while you prepare a set; it's fine to leave it for later."
             ),
         ))
 

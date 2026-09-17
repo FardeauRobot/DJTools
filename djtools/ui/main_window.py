@@ -437,6 +437,7 @@ class MainWindow(QMainWindow):
         selected = set(self._selected_paths())
         values = self.library.cache.values()
         self.model.links = self.library.link_map()
+        self.model.rekordbox = self.library.rekordbox_enabled
         self.model.set_data(self.library.rows(), {v["id"]: v["name"] for v in values}, self._favorite_id(create=False))
         self.tags.rebuild()
         self._refresh_health(refilter=True)

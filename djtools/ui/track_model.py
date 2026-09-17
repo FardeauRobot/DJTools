@@ -25,6 +25,7 @@ class TrackModel(QAbstractTableModel):
         self.value_names = {}  # value id -> name
         self.favorite_id = None
         self._index = {}
+        self.rekordbox = True  # off: no analysis to compare against, so BPM/key are not "file only"
         self.editor = None  # callable(path, column, text) -> bool, for in-place title/artist edits
         self.links = {}  # path -> set of paths it goes well with
 
@@ -153,8 +154,10 @@ class TrackModel(QAbstractTableModel):
                     "Clean up names renames files)."
             return r.path
         if role == Qt.ForegroundRole:
-            if (col == BPM and r.bpm_src == "file") or (col == KEY and r.key_src == "file"):
-                return theme.FILE_SOURCE  # file tag: not rekordbox's own analysis yet
+            # Grey means "the file said so, rekordbox hasn't analysed it". With rekordbox off the file tag
+            # is the only source there is, so greying every row would just say the library is unanalysed.
+            if self.rekordbox and ((col == BPM and r.bpm_src == "file") or (col == KEY and r.key_src == "file")):
+                return theme.FILE_SOURCE
             if col == RB and not r.in_rekordbox:
                 return theme.WARN
             if col == FAV:
