@@ -1,0 +1,19 @@
+Hey, I'd like to create an app to simplify the handling of my library as a DJ
+
+Here is what I want
+
+I select the main folder that holds all the songs I have :
+
+From there, the app creates a listing of every song.
+
+It shows me the key, the BPM, the artist and the name of the track.
+
+I can then create Tags for Genres, mood, where they are supposed to be in the set, also a favorite section
+The tags must be detected by rekordbox, so that I don't want to manually tag them in rekordbox, which is a pain the ass 
+
+It should also allow me to play the selected track
+
+It must also allow me to create folders, delete tracks from the main storage etc. 
+
+If you have suggestions, more questions, don't hesitate <3
+

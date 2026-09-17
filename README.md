@@ -6,7 +6,8 @@ Browse, play, tag and organise a DJ library; tags are written into rekordbox as 
 ./run.sh                      # start the app
 ```
 
-Setup, once: `/opt/homebrew/bin/python3.12 -m venv .venv && .venv/bin/pip install -r requirements.txt`
+No setup step: `run.sh` creates `.venv` on the first run (any Python 3.10+ on `PATH`) and reinstalls
+whenever `requirements.txt` changes. It needs rekordbox 6 on this Mac, with the library already analyzed.
 
 ## How it fits with rekordbox
 

@@ -1,0 +1,15 @@
+# Virtualenv
+.venv/
+venv/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Local caches / state
+.cache/
+*.log
+
+# macOS
+.DS_Store
