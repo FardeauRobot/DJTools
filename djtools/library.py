@@ -10,7 +10,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QFile
 
-from . import health, naming, rekordbox
+from . import cache, health, naming, rekordbox
 from .cache import Cache
 from .config import APP_DIR, AUDIO_EXTS, CACHE_PATH, FAVORITE, SUGGESTED_COLUMNS
 from .scanner import iter_audio_files, read_file, write_title_artist
@@ -36,6 +36,7 @@ class Row:
     has_cover: bool = False
     readable: bool = True
     size: int = 0
+    mtime: float = 0.0
 
     @property
     def ext(self):
@@ -126,8 +127,11 @@ class Library:
             # and the tag panel would open empty on a fresh install without rekordbox.
             self.cache.ensure_local_columns(SUGGESTED_COLUMNS)
         self._health_inputs = None  # (proposals, empty folders): only files changing can change them
-        # Undo steps. A step is a list of ("tag", value_id, on, paths that actually changed)
-        # ("link", path, path, note, created, on) and ("note", path, path, old note, new note) entries.
+        # Undo steps. A step is a list of ("tag", value_id, on, paths that actually changed),
+        # ("link", path, path, note, created, on), ("note", path, path, old note, new note),
+        # ("pl_members", playlist id, old entries, new entries), ("pl_name", playlist id, old, new)
+        # and ("pl_trash", playlist id, on) entries. Playlist entries carry whole values rather than
+        # diffs: that is what makes undoing a reorder a single assignment.
         self._undo, self._redo = [], []
 
     @property
@@ -193,6 +197,11 @@ class Library:
             moves=pending["moves"],
             track_tags={p: tag_map.get(p, set()) for p in pending["dirty_tracks"]},
             value_rb_ids=self.cache.value_rb_ids(),
+            playlist_creates=pending["playlist_creates"],
+            playlist_renames=pending["playlist_renames"],
+            playlist_deletes=pending["playlist_deletes"],
+            playlist_members=pending["playlist_members"],
+            playlist_rb_ids=self.cache.playlist_rb_ids(),
         )
         result = rekordbox.sync(self.settings.rekordbox_db, plan)
         self.cache.mark_synced(result, plan)
@@ -206,7 +215,11 @@ class Library:
         if self.rb_state is not None:
             waiting = sum(1 for path in p["dirty_tracks"] if self.cache.rekordbox_track(self.rb_state, path) is None)
         tag_changes = len(p["column_renames"]) + len(p["new_values"]) + len(p["value_renames"]) + len(p["value_deletes"])
-        return tag_changes + len(p["moves"]) + len(p["dirty_tracks"]) - waiting, waiting
+        playlist_changes = (
+            len(p["playlist_creates"]) + len(p["playlist_renames"])
+            + len(p["playlist_deletes"]) + len(p["playlist_members"])
+        )
+        return tag_changes + playlist_changes + len(p["moves"]) + len(p["dirty_tracks"]) - waiting, waiting
 
     # --- rows and tags -----------------------------------------------------------------------------
 
@@ -217,7 +230,12 @@ class Library:
         out = []
         for t in self.cache.tracks(self.root):
             rb = self.cache.rekordbox_track(self.rb_state, t["path"]) if self.rb_state else None
-            bpm, bpm_src = (rb.bpm, "rekordbox") if rb and rb.bpm else (t["file_bpm"], "file" if t["file_bpm"] else "")
+            if rb and rb.bpm:
+                bpm, bpm_src = rb.bpm, "rekordbox"
+            elif t["file_bpm"]:
+                bpm, bpm_src = t["file_bpm"], "file"
+            else:  # beat_this's estimate, last: it has no beat grid behind it
+                bpm, bpm_src = t["detected_bpm"], "detected" if t["detected_bpm"] else ""
             key, key_src = (rb.key, "rekordbox") if rb and rb.key else (t["file_key"], "file" if t["file_key"] else "")
             folder = os.path.relpath(os.path.dirname(t["path"]), self.root)
             out.append(
@@ -238,6 +256,7 @@ class Library:
                     has_cover=bool(t["has_cover"]),
                     readable=t["readable"] is None or bool(t["readable"]),
                     size=t["size"],
+                    mtime=t["mtime"],
                 )
             )
         return out
@@ -284,6 +303,15 @@ class Library:
             if entry[0] == "tag":
                 _kind, value_id, on, paths = entry
                 self.cache.set_tag(paths, value_id, on != reverse)
+            elif entry[0] == "pl_members":
+                _kind, playlist_id, old_entries, new_entries = entry
+                self.cache.set_members(playlist_id, old_entries if reverse else new_entries)
+            elif entry[0] == "pl_name":
+                _kind, playlist_id, old_name, new_name = entry
+                self.cache.rename_playlist(playlist_id, old_name if reverse else new_name)
+            elif entry[0] == "pl_trash":
+                _kind, playlist_id, on = entry
+                self.cache.trash_playlist(playlist_id, on != reverse, time.time())
             elif entry[0] == "note":
                 _kind, x, y, old, new = entry
                 self.cache.set_link_note(x, y, old if reverse else new)
@@ -339,6 +367,123 @@ class Library:
             out.setdefault(r["a"], set()).add(r["b"])
             out.setdefault(r["b"], set()).add(r["a"])
         return out
+
+    # --- playlists ----------------------------------------------------------------------------------
+    # A mirror of rekordbox's tree: what you build here is what rekordbox plays from. Deleting puts a
+    # playlist in the trash (undoable, restorable); only an explicit purge destroys one.
+
+    def playlists(self):
+        return self.cache.playlists()
+
+    def trashed_playlists(self):
+        return self.cache.trashed_playlists()
+
+    def playlist(self, playlist_id):
+        return self.cache.playlist(playlist_id)
+
+    def playlist_entries(self, playlist_id):
+        """[(path, rb_content_id)] in order. `path` is None for a member outside the DJTools library."""
+        return [(r["path"], r["rb_content_id"]) for r in self.cache.playlist_members(playlist_id)]
+
+    def playlist_paths(self, playlist_id):
+        return [path for path, _cid in self.playlist_entries(playlist_id) if path]
+
+    def playlist_map(self):
+        """path -> set of playlist ids holding it."""
+        return self.cache.playlist_map()
+
+    def _content_id(self, path):
+        """rekordbox's id for a file, so a member survives the file becoming unreachable."""
+        if self.rb_state is None:
+            return None
+        track = self.cache.rekordbox_track(self.rb_state, path)
+        return track.content_id if track else None
+
+    def create_playlist(self, name, parent_id=None, paths=()):
+        """Not undoable: an empty new playlist is harmless, and deleting it is."""
+        playlist_id = self.cache.create_playlist(name, parent_id)
+        if paths:
+            self.add_to_playlist(playlist_id, paths)
+        return playlist_id
+
+    def rename_playlist(self, playlist_id, name):
+        row = self.cache.playlist(playlist_id)
+        if row is None or row["name"] == name:
+            return False
+        self.cache.rename_playlist(playlist_id, name)
+        self._push_undo([("pl_name", playlist_id, row["name"], name)])
+        return True
+
+    def set_playlist_members(self, playlist_id, entries):
+        """Replace the ordered member list as one undoable step. Covers add, remove and reorder."""
+        old = self.playlist_entries(playlist_id)
+        entries = list(entries)
+        if old == entries:
+            return False
+        self.cache.set_members(playlist_id, entries)
+        self._push_undo([("pl_members", playlist_id, old, entries)])
+        return True
+
+    def add_to_playlist(self, playlist_id, paths):
+        """Append, skipping tracks already in it. Returns how many were added."""
+        entries = self.playlist_entries(playlist_id)
+        have = {path for path, _cid in entries}
+        added = [(p, self._content_id(p)) for p in paths if p not in have]
+        if not added:
+            return 0
+        self.set_playlist_members(playlist_id, entries + added)
+        return len(added)
+
+    def remove_from_playlist(self, playlist_id, paths):
+        paths = set(paths)
+        entries = self.playlist_entries(playlist_id)
+        kept = [e for e in entries if e[0] not in paths]
+        if len(kept) == len(entries):
+            return 0
+        self.set_playlist_members(playlist_id, kept)
+        return len(entries) - len(kept)
+
+    def playlist_blockers(self, playlist_id):
+        """Why this playlist can't be deleted, or None. Only plain playlists: v1 can't recreate a folder or a
+        smart playlist, so deleting one would be a trip to the trash with no way back (see restore_blocker)."""
+        row = self.cache.playlist(playlist_id)
+        if row is None:
+            return "That playlist is gone."
+        if row["kind"] != cache.PLAYLIST:
+            what = "folder" if row["kind"] == cache.FOLDER else "smart playlist"
+            return f"DJTools can't recreate a {what}, so it doesn't delete one. Delete it in rekordbox."
+        return None
+
+    def trash_playlist(self, playlist_id, on=True):
+        row = self.cache.playlist(playlist_id)
+        if row is None or bool(row["deleted"]) == on:
+            return False
+        self.cache.trash_playlist(playlist_id, on, time.time())
+        self._push_undo([("pl_trash", playlist_id, on)])
+        return True
+
+    def restore_blocker(self, playlist_id):
+        """Why this trashed playlist can't come back, or None. Restoring re-creates it in rekordbox, and v1
+        only creates plain playlists: a folder or smart playlist would arrive as an empty list."""
+        row = self.cache.playlist(playlist_id)
+        if row is not None and row["kind"] != cache.PLAYLIST:
+            kind = "folder" if row["kind"] == cache.FOLDER else "smart playlist"
+            return f"“{row['name']}” is a {kind}: DJTools can't recreate those. Make it again in rekordbox."
+        return None
+
+    def restore_playlist(self, playlist_id):
+        if self.restore_blocker(playlist_id):
+            return False
+        return self.trash_playlist(playlist_id, on=False)
+
+    def purge_playlist(self, playlist_id):
+        """Destroys it. Not undoable, so never call this without a confirmation."""
+        self.cache.purge_playlist(playlist_id)
+        self.clear_undo()
+
+    def _push_undo(self, step):
+        self._undo.append(step)
+        self._redo.clear()
 
     def clear_undo(self):
         """Tag definitions or file paths changed: old steps could point at tags or files that are gone."""

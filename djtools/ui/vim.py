@@ -6,7 +6,7 @@ track-list commands are looked up in the rebindable keymap (keymap.py).
 """
 import sys
 
-from PySide6.QtCore import QEvent, QItemSelection, QItemSelectionModel, QObject, Qt
+from PySide6.QtCore import QEvent, QItemSelection, QItemSelectionModel, QObject, Qt, QTimer
 from PySide6.QtGui import QKeyEvent
 from PySide6.QtWidgets import QApplication
 
@@ -25,6 +25,7 @@ class VimKeys(QObject):
         self.count = ""
         self.pending = ""  # "g" or "d" waiting for its second key
         self.visual = False
+        self.in_tags = False
         self.anchor = None  # row the extended selection grows from
         w, player = window, window.player
         # What each rebindable track-list key does (keymap.TRACK_KEYS). Counts apply to the moves.
@@ -48,8 +49,11 @@ class VimKeys(QObject):
             "volume_down": lambda: player.volume_by(-5),
             "volume_up": lambda: player.volume_by(5),
             "compatible": w.show_compatible,
+            "detect_bpm": w.detect_bpm_selected,
             "link": lambda: (self._leave_visual(collapse=False), w.link_tracks()),
             "show_linked": w.show_linked,
+            "add_to_playlist": lambda: (self._leave_visual(collapse=False), w.add_to_playlist_dialog()),
+            "show_playlists": w.show_playlists,
             "favorite": w.toggle_favorite,
             "copy_tags": w.copy_tags,
             "paste_tags": w.paste_tags,
@@ -68,6 +72,8 @@ class VimKeys(QObject):
         w = self.w
         if event.type() == QEvent.MouseButtonPress and obj is w.table.viewport():
             self._leave_visual(collapse=False)
+            self.in_tags = False
+            self._message()
             return False
         if event.type() != QEvent.KeyPress:
             return False
@@ -84,6 +90,8 @@ class VimKeys(QObject):
     def _message(self, text=""):
         if self.visual:
             text = f"-- VISUAL --  {text}".rstrip()
+        if self.in_tags:
+            text = f"-- TAGS --  {text}".rstrip()
         if text:
             self.w.statusBar().showMessage(text)
         else:
@@ -205,8 +213,10 @@ class VimKeys(QObject):
     # --- panes -----------------------------------------------------------------------------------
 
     def _focus_table(self):
+        self.in_tags = False
         self.w.table.setFocus()
         self._ensure_selection()
+        self._message()
 
     def _ensure_selection(self):
         """Filtering can leave a current row with nothing selected; select it so tagging has a target."""
@@ -227,9 +237,11 @@ class VimKeys(QObject):
         self._ensure_selection()
         boxes = self._tag_boxes()
         if not boxes:
-            self.w.statusBar().showMessage("Select tracks first to tag them (or switch the tag panel to filtering).", 5000)
+            msg = "Select tracks first to tag them (or switch the tag panel to filtering)."
+            QTimer.singleShot(0, lambda: self.w.statusBar().showMessage(msg, 5000))
             return
         self._leave_visual(collapse=False)
+        self.in_tags = True
         self._focus_box(boxes[0])
 
     # --- folder tree -----------------------------------------------------------------------------
@@ -277,6 +289,16 @@ class VimKeys(QObject):
         cb.setFocus(Qt.ShortcutFocusReason)
         self.w.tags.scroll.ensureWidgetVisible(cb)
 
+    def _new_tag(self, box):
+        """`n` on a tag: prompt for a name and add it to that tag's column, then focus the new tag."""
+        tags = self.w.tags
+        vid = next((v for v, cb in tags.boxes.items() if cb is box), None)
+        if vid is None:
+            return
+        new_id = tags.add_tag_near(vid)
+        if new_id is not None and new_id in tags.boxes:
+            self._focus_box(tags.boxes[new_id])
+
     def _tags_key(self, event):
         # Keys the checkboxes ignore bubble up to the panel, so this sees them wherever focus is inside it.
         key, mods, text = event.key(), event.modifiers(), event.text()
@@ -292,6 +314,9 @@ class VimKeys(QObject):
             return True
         if (text == "x" or key in (Qt.Key_Return, Qt.Key_Enter)) and focused in boxes:
             focused.click()
+            return True
+        if text == "n" and focused in boxes:
+            self._new_tag(focused)
             return True
         if text == "?":
             show_help(self.w)

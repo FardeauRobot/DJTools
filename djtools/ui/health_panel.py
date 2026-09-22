@@ -2,6 +2,7 @@
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import QLabel, QListWidget, QListWidgetItem, QProgressBar, QPushButton, QVBoxLayout, QWidget
 
+from . import icons, theme
 from .theme import DONE as DONE_COLOR
 from .theme import TODO as TODO_COLOR
 from .theme import WARN as WARN_COLOR
@@ -27,13 +28,15 @@ class HealthPanel(QWidget):
         self.explain = QLabel("Click a line to see the tracks concerned and what to do about them.")
         self.explain.setWordWrap(True)
         self.explain.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.explain.setStyleSheet("color: palette(placeholder-text);")
+        self.explain.setFont(theme.font("caption"))
+        self.explain.setProperty("muted", True)
         self.fix_btn = QPushButton()
         self.fix_btn.hide()
         self.fix_btn.clicked.connect(lambda: self.current_id in self.checks and self.fix_requested.emit(self.checks[self.current_id]))
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 4, 0, 0)
+        layout.setContentsMargins(theme.SPACE, theme.SPACE, theme.SPACE, 0)
+        layout.setSpacing(theme.SPACE - 2)
         layout.addWidget(title)
         layout.addWidget(self.progress)
         layout.addWidget(self.list, 1)
@@ -54,10 +57,12 @@ class HealthPanel(QWidget):
         # Required checks first, then the warnings that have something to show.
         ordered = [c for c in report.checks if c.required] + [c for c in report.checks if not c.required and c.count]
         for c in ordered:
-            mark = "✓" if not c.count else ("✗" if c.required else "!")
-            item = QListWidgetItem(f"{mark}  {c.label}" + (f"  ({c.count})" if c.count else ""))
+            color = DONE_COLOR if not c.count else (TODO_COLOR if c.required else WARN_COLOR)
+            name = "check" if not c.count else ("close" if c.required else "alert")
+            item = QListWidgetItem(icons.icon(name, color.name(), 14),
+                                   c.label + (f"  ({c.count})" if c.count else ""))
             item.setData(CHECK_ROLE, c.id)
-            item.setForeground(DONE_COLOR if not c.count else (TODO_COLOR if c.required else WARN_COLOR))
+            item.setForeground(color)
             if not c.required:
                 font = item.font()
                 font.setItalic(True)

@@ -105,7 +105,7 @@ def run(rows, proposals, empty, root, columns, values, rekordbox_readable):
             "not_analyzed", "Not analyzed by rekordbox", required=True, paths=not_analyzed,
             explain="rekordbox has these tracks but hasn't analyzed them: no beat grid, no reliable BPM or key, so "
             "sync and key matching on the decks won't work. In rekordbox select them, right-click → Analyze Track, "
-            "then Rescan here. Grey BPM/key values come from the file and may be wrong.",
+            "then Rescan here. Grey BPM/key values come from the file tag or from DJTools' own detection and may be wrong.",
         ))
 
     value_column = {v["id"]: v["column_rb_id"] for v in values}

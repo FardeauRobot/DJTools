@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
 )
 
 from .. import naming
+from . import icons, theme
 from .theme import EDIT as EDIT_COLOR
 from .theme import TODO as WARN_COLOR
 
@@ -24,7 +25,7 @@ HEADERS = ["", "Current file", "New title", "New artist", "New file", "Notes"]
 
 INTRO = (
     "Proposed fixes, following the library's naming rules. <b>Blue</b> = will change. Double-click a title or "
-    "artist to correct it; lines marked ✗ need a look and aren't ticked. Nothing is changed until you apply."
+    "artist to correct it; flagged lines need a look and aren't ticked. Nothing is changed until you apply."
     "<br><br>Only the title and artist are written inside the files; cues, key, BPM and artwork are kept. "
     "Renamed files follow in rekordbox at the next <b>Sync</b>. To refresh the titles shown in rekordbox, select "
     "the tracks there and right-click → <i>Reload Tag</i>."
@@ -50,6 +51,9 @@ class CleanupDialog(QDialog):
         self.table = QTableWidget(len(proposals), len(HEADERS))
         self.table.setHorizontalHeaderLabels(HEADERS)
         self.table.verticalHeader().hide()
+        self.table.verticalHeader().setDefaultSectionSize(theme.ROW_HEIGHT)
+        self.table.setShowGrid(False)
+        self.table.setAlternatingRowColors(False)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed)
         self.table.setWordWrap(False)
@@ -65,6 +69,7 @@ class CleanupDialog(QDialog):
         none_btn = QPushButton("Untick all")
         none_btn.clicked.connect(lambda: self._tick_all(False))
         self.apply_btn = QPushButton()
+        self.apply_btn.setProperty("primary", True)  # the one button here that touches files
         self.apply_btn.setDefault(True)
         self.apply_btn.clicked.connect(self._apply)
         cancel = QPushButton("Close")
@@ -108,7 +113,9 @@ class CleanupDialog(QDialog):
             item.setToolTip(tip or text)
             return item
 
-        tick = QTableWidgetItem("" if p.safe else "✗")
+        tick = QTableWidgetItem()
+        if not p.safe:
+            tick.setIcon(icons.icon("alert", WARN_COLOR.name(), 13))
         tick.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
         tick.setCheckState(Qt.Checked if self.ticked.get(p.path) else Qt.Unchecked)
         if not p.safe:

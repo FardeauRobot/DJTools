@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
 )
 
 from .. import keys
-from . import theme
+from . import icons, theme
 
 PATHS_ROLE = Qt.UserRole + 1
 
@@ -66,7 +66,7 @@ class LinkPicker(QDialog):
         self.linked_only.toggled.connect(self._apply_filter)
 
         self.list = QListWidget()
-        self.list.setAlternatingRowColors(True)
+        self.list.setAlternatingRowColors(False)
         others = [r for r in rows if r.path != source.path]
         others.sort(key=lambda r: (r.path not in self.linked, track_label(r).lower()))
         for r in others:
@@ -90,7 +90,7 @@ class LinkPicker(QDialog):
         self.count = QLabel()
 
         hint = QLabel("Space or double-click ticks a track. Links stay in DJTools (rekordbox doesn't get them).")
-        hint.setStyleSheet("color: palette(placeholder-text);")
+        hint.setProperty("muted", True)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
@@ -182,12 +182,14 @@ class LinksWindow(QDialog):
             "or select several tracks and press ⌘L to link them together."
         )
         self.empty.setWordWrap(True)
-        self.empty.setStyleSheet("color: palette(placeholder-text);")
+        self.empty.setProperty("muted", True)
 
         self.table = QTableWidget(0, 4)
         self.table.setHorizontalHeaderLabels(["Track", "Goes well with", "Note", "Added"])
         self.table.verticalHeader().hide()
-        self.table.setAlternatingRowColors(True)
+        self.table.setAlternatingRowColors(False)
+        self.table.setShowGrid(False)
+        self.table.verticalHeader().setDefaultSectionSize(theme.ROW_HEIGHT)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.table.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed)
@@ -206,7 +208,7 @@ class LinksWindow(QDialog):
         self.show_btn = QPushButton("Show in list")
         self.show_btn.setToolTip("Show the selected links' tracks in the main list")
         self.show_btn.clicked.connect(self._show_selected)
-        self.play_btn = QPushButton("▶ Play")
+        self.play_btn = QPushButton(icons.icon("play"), " Play")
         self.play_btn.setToolTip("Play the track in the column you clicked")
         self.play_btn.clicked.connect(self._play_current)
         self.unlink_btn = QPushButton("Unlink")
@@ -217,7 +219,7 @@ class LinksWindow(QDialog):
         self.missing_btn.clicked.connect(self._unlink_missing)
         self.hint_text = "Double-click a track to find it, or a note to edit it."
         self.hint = hint = QLabel(self.hint_text)
-        hint.setStyleSheet("color: palette(placeholder-text);")
+        hint.setProperty("muted", True)
         self._hint_timer = QTimer(self, singleShot=True, timeout=lambda: self.hint.setText(self.hint_text))
         # This is its own window: the main window's ⌘Z doesn't reach it.
         for seq, signal in ((QKeySequence.Undo, self.undo_requested), (QKeySequence.Redo, self.redo_requested)):

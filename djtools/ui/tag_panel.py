@@ -10,7 +10,6 @@ The number after each tag counts the tracks carrying it in the current list.
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
-    QGroupBox,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -24,7 +23,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..config import FAVORITE
-from . import theme
+from . import icons, theme
 
 
 class TagPanel(QWidget):
@@ -38,6 +37,7 @@ class TagPanel(QWidget):
         self.selected = []  # paths
         self.boxes = {}  # value id -> QCheckBox
         self.names = {}  # value id -> label without the count
+        self.value_column = {}  # value id -> its column row
         self.counts = {}
         self.filter_ids = set()  # must have
         self.exclude_ids = set()
@@ -47,7 +47,8 @@ class TagPanel(QWidget):
         self.mode_btn.toggled.connect(self._mode_changed)
         self.hint = QLabel()
         self.hint.setWordWrap(True)
-        self.hint.setStyleSheet("color: palette(placeholder-text);")
+        self.hint.setFont(theme.font("caption"))
+        self.hint.setProperty("muted", True)
         self.match_btn = QPushButton("Match: all ticked tags")
         self.match_btn.setCheckable(True)
         self.match_btn.setToolTip("All: a track needs every ticked tag. Any: one of them is enough.")
@@ -56,13 +57,15 @@ class TagPanel(QWidget):
 
         self.inner = QWidget()
         self.inner_layout = QVBoxLayout(self.inner)
-        self.inner_layout.setContentsMargins(0, 0, 0, 0)
+        self.inner_layout.setContentsMargins(0, 0, theme.SPACE, 0)
+        self.inner_layout.setSpacing(theme.SPACE * 2)
         self.scroll = scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(self.inner)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setContentsMargins(theme.SPACE, theme.SPACE, theme.SPACE, theme.SPACE)
+        layout.setSpacing(theme.SPACE)
         layout.addWidget(self.mode_btn)
         layout.addWidget(self.hint)
         layout.addWidget(self.match_btn)
@@ -81,7 +84,7 @@ class TagPanel(QWidget):
             if item.widget():
                 item.widget().hide()  # deleteLater waits for the event loop; don't leave it drawn meanwhile
                 item.widget().deleteLater()
-        self.boxes, self.names = {}, {}
+        self.boxes, self.names, self.value_column = {}, {}, {}
         columns = self.library.cache.columns()
         local = not self.library.rekordbox_enabled
         if not columns:
@@ -96,20 +99,29 @@ class TagPanel(QWidget):
         self.filter_ids &= live_ids
         self.exclude_ids &= live_ids
         for column in columns:
-            box = QGroupBox()
+            box = QWidget()
             v_layout = QVBoxLayout(box)
+            v_layout.setContentsMargins(0, 0, 0, 0)
+            v_layout.setSpacing(2)
             header = QHBoxLayout()
-            title = QLabel(f"<b>{column['name']}</b>")
-            rename = QToolButton(text="✎")
+            header.setContentsMargins(0, 0, 0, 0)
+            title = QLabel(column["name"])
+            title.setFont(theme.font("label"))
+            rename = QToolButton(icon=icons.icon("pencil", theme.MUTED, 14))
             rename.setToolTip("Rename this column" if local else "Rename this My Tag column")
             rename.clicked.connect(lambda _=False, c=column: self._rename_column(c))
-            add = QToolButton(text="+")
+            add = QToolButton(icon=icons.icon("plus", theme.MUTED, 14))
             add.setToolTip(f"New tag in {column['name']}")
             add.clicked.connect(lambda _=False, c=column: self._add_value(c))
             header.addWidget(title, 1)
             header.addWidget(rename)
             header.addWidget(add)
             v_layout.addLayout(header)
+            rule = QWidget()
+            rule.setObjectName("Rule")
+            rule.setFixedHeight(1)
+            v_layout.addWidget(rule)
+            v_layout.addSpacing(2)
             for value in (v for v in values if v["column_rb_id"] == column["rb_id"]):
                 # The • means "rekordbox hasn't got this yet". With rekordbox off nothing is waiting on it.
                 unsynced = not local and (value["rb_id"] is None or value["dirty"])
@@ -121,6 +133,7 @@ class TagPanel(QWidget):
                 cb.clicked.connect(lambda _checked, vid=value["id"]: self._clicked(vid))
                 v_layout.addWidget(cb)
                 self.boxes[value["id"]] = cb
+                self.value_column[value["id"]] = column
             self.inner_layout.addWidget(box)
         self.inner_layout.addStretch(1)
         self.refresh_states()
@@ -139,12 +152,14 @@ class TagPanel(QWidget):
         font = cb.font()
         font.setStrikeOut(excluded)
         cb.setFont(font)
-        cb.setStyleSheet(f"color: {theme.TODO.name()};" if excluded else "")
+        if cb.property("excluded") != excluded:
+            cb.setProperty("excluded", excluded)
+            theme.restyle(cb)  # a property changed after construction needs unpolish/polish
 
     def refresh_states(self):
         self.match_btn.setVisible(self.filtering)
         if self.filtering:
-            self.hint.setText("Click a tag: ✓ must have → ▬ exclude (struck through) → off.")
+            self.hint.setText("Click a tag: tick to require it, again to exclude it (struck through), again for off.")
             for vid, cb in self.boxes.items():
                 cb.setEnabled(True)
                 cb.setTristate(True)
@@ -221,16 +236,22 @@ class TagPanel(QWidget):
             self.library.cache.rename_column(column["rb_id"], name)
             self.definitions_edited.emit()
 
+    def add_tag_near(self, value_id):
+        """Create a new tag in the same column as `value_id` (the `n` keyboard shortcut). Returns its id, or None."""
+        column = self.value_column.get(value_id)
+        return self._add_value(column) if column else None
+
     def _add_value(self, column):
         name = self._ask("New tag", f"New tag in “{column['name']}”:")
         if not name:
-            return
+            return None
         existing = {v["name"].lower() for v in self.library.cache.values() if v["column_rb_id"] == column["rb_id"]}
         if name.lower() in existing:
             QMessageBox.information(self, "New tag", f"“{name}” already exists in {column['name']}.")
-            return
-        self.library.cache.add_value(column["rb_id"], name)
+            return None
+        new_id = self.library.cache.add_value(column["rb_id"], name)
         self.definitions_edited.emit()
+        return new_id
 
     def _value_menu(self, value, widget):
         menu = QMenu(self)
@@ -244,7 +265,7 @@ class TagPanel(QWidget):
                 self.definitions_edited.emit()
         elif chosen == delete:
             if value["name"].lower() == FAVORITE.lower():
-                note = "\n\nThe ★ column uses this tag; it will be recreated the next time you mark a favorite."
+                note = "\n\nThe favourites column uses this tag; it comes back the next time you mark a favorite."
             else:
                 note = ""
             answer = QMessageBox.question(

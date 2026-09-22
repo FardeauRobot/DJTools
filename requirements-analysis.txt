@@ -1,0 +1,4 @@
+# Optional: BPM detection (View → Detect missing BPMs…). Pulls in PyTorch, about 1 GB.
+# Install with: .venv/bin/pip install -r requirements-analysis.txt
+beat-this>=1.1
+soundfile>=0.12

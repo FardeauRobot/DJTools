@@ -1,8 +1,9 @@
 """Local SQLite store: scanned file metadata plus the working copy of tags and pending rekordbox changes."""
 import sqlite3
+import time
 
 from .config import LOCAL_COLUMN_PREFIX
-from .rekordbox import norm
+from .rekordbox import ROOT_PARENT, norm
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tracks (
@@ -27,8 +28,22 @@ CREATE TABLE IF NOT EXISTS pending_moves (
 CREATE TABLE IF NOT EXISTS track_links (
     a TEXT NOT NULL, b TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', created REAL, PRIMARY KEY (a, b)
 );
+CREATE TABLE IF NOT EXISTS playlists (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, rb_id TEXT UNIQUE, parent_id INTEGER, name TEXT NOT NULL,
+    seq INTEGER NOT NULL, kind INTEGER NOT NULL DEFAULT 0, smart_xml TEXT,
+    dirty INTEGER NOT NULL DEFAULT 0, members_dirty INTEGER NOT NULL DEFAULT 0,
+    deleted INTEGER NOT NULL DEFAULT 0, deleted_at REAL
+);
+CREATE TABLE IF NOT EXISTS playlist_tracks (
+    playlist_id INTEGER NOT NULL, pos INTEGER NOT NULL, path TEXT, rb_content_id TEXT,
+    PRIMARY KEY (playlist_id, pos)
+);
+CREATE INDEX IF NOT EXISTS playlist_tracks_path ON playlist_tracks(path);
 """
 TRACK_COLUMNS_V2 = ("title_tag", "bitrate", "has_cover", "readable")
+
+# DjmdPlaylist.Attribute, mirrored verbatim.
+PLAYLIST, FOLDER, SMART = 0, 1, 4
 
 
 class Cache:
@@ -46,6 +61,9 @@ class Cache:
             self.db.execute(f"ALTER TABLE tracks ADD COLUMN {column} INTEGER")
         if added:
             self.db.execute("UPDATE tracks SET size=-1")  # re-read every file at the next scan
+        if "detected_bpm" not in have:
+            # Filled by analysis.analyze(), not by a scan: nothing to re-read.
+            self.db.execute("ALTER TABLE tracks ADD COLUMN detected_bpm REAL")
 
     def close(self):
         self.db.close()
@@ -67,10 +85,15 @@ class Cache:
         )
         self.db.commit()
 
+    def set_detected_bpm(self, path, bpm):
+        """Stored beside the scanned facts. upsert_tracks() replaces the row, so a changed file loses it."""
+        self.db.execute("UPDATE tracks SET detected_bpm=? WHERE path=?", (bpm, path))
+        self.db.commit()
+
     def forget_tracks(self, paths):
         """Drop files that no longer exist. Pending moves are kept: they still describe rekordbox's paths.
-        Links are kept too: they exist only here, and a file renamed outside DJTools would otherwise lose them.
-        The Links window lists them as missing."""
+        Links and playlist membership are kept too: a file renamed outside DJTools would otherwise lose them,
+        and a playlist must not shrink because the stick is unplugged. Both windows list them as missing."""
         rows = [(p,) for p in paths]
         self.db.executemany("DELETE FROM tracks WHERE path=?", rows)
         self.db.executemany("DELETE FROM track_tags WHERE path=?", rows)
@@ -86,6 +109,7 @@ class Cache:
             self.db.execute(f"UPDATE OR REPLACE {table} SET path=? WHERE path=?", (new, old))
         self.db.execute("UPDATE tracks SET nkey=? WHERE path=?", (norm(new), new))
         self._rename_links(old, new)
+        self._rename_playlist_tracks(old, new)
         # Chain moves so rekordbox gets a single old -> final update.
         row = self.db.execute("SELECT id FROM pending_moves WHERE new_path=?", (old,)).fetchone()
         if row:
@@ -186,6 +210,89 @@ class Cache:
                     (a, b, r["note"], r["created"]),
                 )
 
+    # --- playlists ---------------------------------------------------------------------------------
+    # Mirrors rekordbox's tree. `rb_id IS NULL` = local only; `deleted=1` = in the trash, meaning
+    # "remove it from rekordbox at the next sync but keep it here so it can be restored". Only an
+    # explicit purge drops the rows. Members keep `rb_content_id` whenever rekordbox knows the track,
+    # so a member list edited while the files are unreachable still pushes back intact.
+
+    def playlists(self):
+        return self.db.execute("SELECT * FROM playlists WHERE deleted=0 ORDER BY seq, id").fetchall()
+
+    def trashed_playlists(self):
+        return self.db.execute("SELECT * FROM playlists WHERE deleted=1 ORDER BY deleted_at DESC, id").fetchall()
+
+    def playlist(self, playlist_id):
+        return self.db.execute("SELECT * FROM playlists WHERE id=?", (playlist_id,)).fetchone()
+
+    def playlist_members(self, playlist_id):
+        return self.db.execute(
+            "SELECT * FROM playlist_tracks WHERE playlist_id=? ORDER BY pos", (playlist_id,)
+        ).fetchall()
+
+    def playlist_map(self):
+        out = {}
+        for r in self.db.execute(
+            "SELECT t.path AS path, t.playlist_id AS pid FROM playlist_tracks t "
+            "JOIN playlists p ON p.id = t.playlist_id WHERE p.deleted=0 AND t.path IS NOT NULL"
+        ):
+            out.setdefault(r["path"], set()).add(r["pid"])
+        return out
+
+    def create_playlist(self, name, parent_id=None, kind=PLAYLIST):
+        seq = self._next_seq(parent_id)
+        cur = self.db.execute(
+            "INSERT INTO playlists (rb_id, parent_id, name, seq, kind, dirty) VALUES (NULL,?,?,?,?,1)",
+            (parent_id, name, seq, kind),
+        )
+        self.db.commit()
+        return cur.lastrowid
+
+    def rename_playlist(self, playlist_id, name):
+        self.db.execute("UPDATE playlists SET name=?, dirty=1 WHERE id=?", (name, playlist_id))
+        self.db.commit()
+
+    def _next_seq(self, parent_id):
+        if parent_id is None:
+            sql = "SELECT COALESCE(MAX(seq), 0) + 1 FROM playlists WHERE parent_id IS NULL"
+            return self.db.execute(sql).fetchone()[0]
+        sql = "SELECT COALESCE(MAX(seq), 0) + 1 FROM playlists WHERE parent_id=?"
+        return self.db.execute(sql, (parent_id,)).fetchone()[0]
+
+    def set_members(self, playlist_id, entries):
+        """Replace the whole ordered member list. `entries` is [(path, rb_content_id)].
+
+        Delete-then-insert, never an in-place renumbering: PRIMARY KEY (playlist_id, pos) collides
+        halfway through any reorder that updates `pos` row by row.
+        """
+        self.db.execute("DELETE FROM playlist_tracks WHERE playlist_id=?", (playlist_id,))
+        self.db.executemany(
+            "INSERT INTO playlist_tracks (playlist_id, pos, path, rb_content_id) VALUES (?,?,?,?)",
+            [(playlist_id, i, path, content_id) for i, (path, content_id) in enumerate(entries, 1)],
+        )
+        self.db.execute("UPDATE playlists SET members_dirty=1 WHERE id=?", (playlist_id,))
+        self.db.commit()
+
+    def trash_playlist(self, playlist_id, on, when=None):
+        if on:
+            self.db.execute("UPDATE playlists SET deleted=1, deleted_at=? WHERE id=?", (when, playlist_id))
+        else:
+            # Restoring re-pushes everything: rekordbox may have lost the playlist in the meantime.
+            self.db.execute(
+                "UPDATE playlists SET deleted=0, deleted_at=NULL, dirty=1, members_dirty=1 WHERE id=?",
+                (playlist_id,),
+            )
+        self.db.commit()
+
+    def purge_playlist(self, playlist_id):
+        """The only path that destroys a playlist. Never called without a confirmation."""
+        self.db.execute("DELETE FROM playlist_tracks WHERE playlist_id=?", (playlist_id,))
+        self.db.execute("DELETE FROM playlists WHERE id=?", (playlist_id,))
+        self.db.commit()
+
+    def _rename_playlist_tracks(self, old, new):
+        self.db.execute("UPDATE playlist_tracks SET path=? WHERE path=?", (new, old))
+
     # --- rekordbox reconciliation ------------------------------------------------------------------
 
     def ensure_local_columns(self, names):
@@ -271,7 +378,58 @@ class Cache:
                 "INSERT OR IGNORE INTO track_tags VALUES (?,?)",
                 [(row["path"], local_by_rb[t]) for t in rb_track.tag_ids if t in local_by_rb],
             )
+        self._import_playlists(state)
         db.commit()
+
+    def _import_playlists(self, state):
+        """Mirror rekordbox's playlist tree in, without overwriting anything edited here and not yet synced.
+
+        A playlist rekordbox no longer lists goes to the trash rather than being deleted: this is a two-way
+        mirror, so a hard delete here would be unrecoverable. Its `rb_id` is cleared at the same time --
+        `deleted=1` otherwise means "push this delete", for an id rekordbox no longer has.
+        """
+        db = self.db
+        for rb_id, parent, name, seq, attribute, smart_xml in state.playlists:
+            db.execute(
+                "INSERT INTO playlists (rb_id, parent_id, name, seq, kind, smart_xml) VALUES (?,NULL,?,?,?,?) "
+                "ON CONFLICT(rb_id) DO UPDATE SET seq=excluded.seq, kind=excluded.kind, "
+                "smart_xml=excluded.smart_xml, name=CASE WHEN dirty THEN name ELSE excluded.name END",
+                (rb_id, name, seq, attribute, smart_xml),
+            )
+        local_by_rb = {
+            r["rb_id"]: r["id"] for r in db.execute("SELECT id, rb_id FROM playlists WHERE rb_id IS NOT NULL")
+        }
+        for rb_id, parent, _name, _seq, _attribute, _smart in state.playlists:
+            # rekordbox's root is our NULL parent; a folder we don't know yet leaves the playlist at the root.
+            db.execute(
+                "UPDATE playlists SET parent_id=? WHERE rb_id=? AND dirty=0",
+                (local_by_rb.get(parent) if parent != ROOT_PARENT else None, rb_id),
+            )
+        for rb_id, local_id in local_by_rb.items():
+            if rb_id not in {p[0] for p in state.playlists}:  # deleted inside rekordbox
+                db.execute(
+                    "UPDATE playlists SET deleted=1, deleted_at=COALESCE(deleted_at, ?), rb_id=NULL WHERE id=?",
+                    (time.time(), local_id),
+                )
+
+        by_content = self._paths_by_content_id(state)
+        for rb_id, local_id in local_by_rb.items():
+            row = db.execute("SELECT kind, members_dirty, deleted FROM playlists WHERE id=?", (local_id,)).fetchone()
+            if row is None or row["members_dirty"] or row["deleted"] or row["kind"] != PLAYLIST:
+                continue  # local edits win, exactly as dirty_tracks does for tags
+            entries = [(by_content.get(cid), cid) for cid in state.playlist_songs.get(rb_id, [])]
+            db.execute("DELETE FROM playlist_tracks WHERE playlist_id=?", (local_id,))
+            db.executemany(
+                "INSERT INTO playlist_tracks (playlist_id, pos, path, rb_content_id) VALUES (?,?,?,?)",
+                [(local_id, i, path, cid) for i, (path, cid) in enumerate(entries, 1)],
+            )
+
+    def _paths_by_content_id(self, state):
+        """rekordbox content id -> the path this cache knows the file under (following an unsynced move)."""
+        known = {r["nkey"]: r["path"] for r in self.db.execute("SELECT path, nkey FROM tracks")}
+        for r in self.db.execute("SELECT old_path, new_path FROM pending_moves"):
+            known[norm(r["old_path"])] = r["new_path"]  # rekordbox still has the pre-move path
+        return {track.content_id: known.get(nkey) for nkey, track in state.tracks.items()}
 
     def rekordbox_track(self, state, path):
         """rekordbox's entry for a file, following a move that hasn't been synced yet."""
@@ -293,7 +451,30 @@ class Cache:
             "value_deletes": [r["rb_id"] for r in q("SELECT rb_id FROM tag_values WHERE deleted=1")],
             "moves": [(r["old_path"], r["new_path"]) for r in q("SELECT * FROM pending_moves ORDER BY id")],
             "dirty_tracks": [r["path"] for r in q("SELECT path FROM dirty_tracks")],
+            # Parents resolve to rekordbox ids here: v1 never creates folders, so a parent is always a
+            # folder rekordbox already has (or the root). `kind=0` is that rule enforced: a folder or smart
+            # playlist without an rb_id (dropped by rekordbox, then restored) would arrive as a plain list.
+            "playlist_creates": [
+                (r["id"], r["parent_rb_id"], r["name"])
+                for r in q(
+                    "SELECT p.id, p.name, parent.rb_id AS parent_rb_id FROM playlists p "
+                    "LEFT JOIN playlists parent ON parent.id = p.parent_id "
+                    "WHERE p.rb_id IS NULL AND p.deleted=0 AND p.kind=0 ORDER BY p.id"
+                )
+            ],
+            "playlist_renames": [
+                (r["rb_id"], r["name"])
+                for r in q("SELECT rb_id, name FROM playlists WHERE dirty=1 AND rb_id IS NOT NULL AND deleted=0")
+            ],
+            "playlist_deletes": [r["rb_id"] for r in q("SELECT rb_id FROM playlists WHERE deleted=1 AND rb_id IS NOT NULL")],
+            "playlist_members": {
+                r["id"]: [(m["path"], m["rb_content_id"]) for m in self.playlist_members(r["id"])]
+                for r in q("SELECT id FROM playlists WHERE members_dirty=1 AND deleted=0 AND kind=0")
+            },
         }
+
+    def playlist_rb_ids(self):
+        return {r["id"]: r["rb_id"] for r in self.db.execute("SELECT id, rb_id FROM playlists WHERE rb_id IS NOT NULL")}
 
     def value_rb_ids(self):
         return {r["id"]: r["rb_id"] for r in self.db.execute("SELECT id, rb_id FROM tag_values WHERE rb_id IS NOT NULL")}
@@ -305,6 +486,12 @@ class Cache:
         db.execute("UPDATE tag_columns SET dirty=0")
         db.execute("UPDATE tag_values SET dirty=0")
         db.execute("DELETE FROM tag_values WHERE deleted=1")
+        for local_id, rb_id in result.playlists_created.items():
+            db.execute("UPDATE playlists SET rb_id=? WHERE id=?", (rb_id, local_id))
+        db.execute("UPDATE playlists SET dirty=0, members_dirty=0 WHERE deleted=0")
+        # A trashed playlist is NOT deleted here: it stays in the trash, restorable, now with no rekordbox
+        # counterpart left to delete.
+        db.execute("UPDATE playlists SET rb_id=NULL, dirty=0, members_dirty=0 WHERE deleted=1")
         # Moves of files rekordbox doesn't know are dropped too: there is nothing left to update.
         db.execute("DELETE FROM pending_moves")
         db.executemany("DELETE FROM dirty_tracks WHERE path=?", [(p,) for p in result.synced_paths])

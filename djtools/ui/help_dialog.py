@@ -28,6 +28,7 @@ COLUMNS = [
         ("In the tag panel & folders", [
             ("j / k", "next / previous"),
             ("Space / x / Enter", "tick / untick a tag"),
+            ("n", "new tag in this column"),
             ("h / l", "collapse / expand a folder"),
             ("Esc", "back to the tracks"),
         ]),
@@ -43,10 +44,16 @@ COLUMNS = [
         ]),
         ("Mix", [
             ("@compatible · #m_compatible", "tracks that mix with this one"),
+            ("@detect_bpm", "detect BPM"),
             ("@link · #m_link", "link: goes well with…"),
             ("@show_linked · #m_show_linked", "show the linked tracks"),
             ("#m_all_links", "all links"),
             ("#m_clear_filters", "clear filters"),
+        ]),
+        ("Playlists", [
+            ("@add_to_playlist · #m_add_playlist", "add to a playlist…"),
+            ("@show_playlists · #m_show_playlist", "show a playlist this track is in"),
+            ("#m_playlists", "all playlists"),
         ]),
     ],
     [
@@ -75,7 +82,7 @@ QLabel[chip="true"] {{ background: {theme.RAISED}; border: 1px solid {theme.BORD
 QLabel[chip="true"][fixed="true"] {{ background: transparent; color: {theme.MUTED}; }}
 QLabel[chip="true"][fixed="false"]:hover {{ border-color: {theme.ACCENT}; }}
 QLabel[chip="true"][custom="true"] {{ color: {theme.ACCENT}; }}
-QLabel[chip="true"][capturing="true"] {{ border-color: {theme.ACCENT}; color: {theme.ACCENT}; background: #3a3222; }}
+QLabel[chip="true"][capturing="true"] {{ border-color: {theme.ACCENT}; color: {theme.ACCENT}; background: {theme.SEL}; }}
 #Sep, #Status {{ color: {theme.MUTED}; }}
 #Status[error="true"] {{ color: {theme.TODO.name()}; }}
 """
@@ -83,9 +90,7 @@ QLabel[chip="true"][capturing="true"] {{ border-color: {theme.ACCENT}; color: {t
 MODIFIER_KEYS = {Qt.Key_Shift, Qt.Key_Control, Qt.Key_Meta, Qt.Key_Alt, Qt.Key_AltGr, Qt.Key_CapsLock}
 
 
-def _restyle(widget):
-    widget.style().unpolish(widget)
-    widget.style().polish(widget)
+_restyle = theme.restyle  # the shared helper; this dialog had it first
 
 
 class Chip(QLabel):

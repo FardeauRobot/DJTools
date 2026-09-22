@@ -40,6 +40,11 @@ def to_camelot(raw):
     return _BY_PITCH.get((pitch, minor))
 
 
+def note(camelot):
+    """The key written as a note ("Am"), for showing beside the Camelot code."""
+    return _CAMELOT.get(camelot, "") if camelot else ""
+
+
 def display(camelot):
     if not camelot:
         return ""
@@ -47,10 +52,14 @@ def display(camelot):
 
 
 def sort_key(camelot):
-    """Order 1A, 1B, 2A, 2B … so harmonic neighbours sit together."""
+    """Order 1A, 1B, 2A, 2B … so harmonic neighbours sit together, blanks last.
+
+    A plain int, not a tuple: the table hands this to Qt as a sort role, and Qt cannot compare
+    two Python tuples wrapped in a QVariant — it silently leaves the column unsorted.
+    """
     if not camelot:
-        return (99, "")
-    return (int(camelot[:-1]), camelot[-1])
+        return 999
+    return int(camelot[:-1]) * 2 + (camelot[-1] == "B")
 
 
 def neighbours(camelot):

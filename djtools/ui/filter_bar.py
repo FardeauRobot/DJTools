@@ -3,6 +3,7 @@ from PySide6.QtCore import Signal
 from PySide6.QtWidgets import QCheckBox, QComboBox, QHBoxLayout, QLabel, QPushButton, QSpinBox, QToolButton, QWidget
 
 from .. import keys
+from . import icons, theme
 
 
 class FilterBar(QWidget):
@@ -35,8 +36,9 @@ class FilterBar(QWidget):
         self.untagged.toggled.connect(self._user_changed)
 
         self.context = QLabel()
-        self.context.setStyleSheet("color: palette(link);")
-        self.context_clear = QToolButton(text="✕")
+        self.context.setFont(theme.font("caption"))
+        self.context.setProperty("accent", True)
+        self.context_clear = QToolButton(icon=icons.icon("close", theme.MUTED, 13))
         self.context_clear.setToolTip("Stop matching this track")
         self.context_clear.clicked.connect(self.clear)
         self.context.hide()

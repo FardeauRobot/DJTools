@@ -1,14 +1,31 @@
 """Table model for tracks, plus the proxy that searches, filters by folder and by tag, and sorts."""
+from datetime import datetime
+
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, QSortFilterProxyModel, Qt
 
 from .. import keys
 from . import theme
 
-FAV, TITLE, ARTIST, BPM, KEY, RB, TAGS, LINKS, FOLDER, TIME, FORMAT, BITRATE = range(12)
-HEADERS = ["★", "Title", "Artist", "BPM", "Key", "rekordbox", "My Tags", "Links", "Folder", "Time", "Format", "Bitrate"]
+FAV, TITLE, ARTIST, BPM, KEY, RB, TAGS, LINKS, PLAYLISTS, FOLDER, TIME, FORMAT, BITRATE, DATE = range(14)
+HEADERS = ["", "Title", "Artist", "BPM", "Key", "rekordbox", "My Tags", "Links", "Playlists", "Folder", "Time",
+           "Format", "Bitrate", "Date"]
 HIDDEN_BY_DEFAULT = (FORMAT, BITRATE)
 PATH_ROLE = Qt.UserRole + 1
 SORT_ROLE = Qt.UserRole + 2
+# The five columns that ui/delegates.py paints rather than prints. Each hands the delegate the
+# value itself instead of a string, so the drawing code never has to parse its own output back.
+KEY_ROLE = Qt.UserRole + 3
+TAGS_ROLE = Qt.UserRole + 4
+LINKS_ROLE = Qt.UserRole + 5
+RB_ROLE = Qt.UserRole + 6
+FAV_ROLE = Qt.UserRole + 7
+PLAYLISTS_ROLE = Qt.UserRole + 8
+
+
+def fmt_date(mtime):
+    if not mtime:
+        return ""
+    return datetime.fromtimestamp(mtime).strftime("%Y-%m-%d")
 
 
 def fmt_time(seconds):
@@ -28,6 +45,8 @@ class TrackModel(QAbstractTableModel):
         self.rekordbox = True  # off: no analysis to compare against, so BPM/key are not "file only"
         self.editor = None  # callable(path, column, text) -> bool, for in-place title/artist edits
         self.links = {}  # path -> set of paths it goes well with
+        self.playlists = {}  # path -> set of playlist ids holding it
+        self.playlist_names = {}  # playlist id -> name, for the tooltip
 
     def set_data(self, rows, value_names, favorite_id):
         self.beginResetModel()
@@ -47,6 +66,11 @@ class TrackModel(QAbstractTableModel):
         self.links = links
         if self.rows:
             self.dataChanged.emit(self.index(0, LINKS), self.index(len(self.rows) - 1, LINKS))
+
+    def set_playlists(self, playlists, names):
+        self.playlists, self.playlist_names = playlists, names
+        if self.rows:
+            self.dataChanged.emit(self.index(0, PLAYLISTS), self.index(len(self.rows) - 1, PLAYLISTS))
 
     def index_for(self, path, column=0):
         i = self._index.get(path)
@@ -93,13 +117,23 @@ class TrackModel(QAbstractTableModel):
         self.dataChanged.emit(self.index(i, 0), self.index(i, len(HEADERS) - 1))
 
     def headerData(self, section, orientation, role=Qt.DisplayRole):
-        if orientation == Qt.Horizontal and role == Qt.DisplayRole:
+        if orientation != Qt.Horizontal:
+            return None
+        if role == Qt.DisplayRole:
             return HEADERS[section]
+        if role == Qt.ToolTipRole and section == FAV:
+            return "Favorite"  # the header cannot show the star: QHeaderView ignores item delegates
+        if role == Qt.TextAlignmentRole:
+            # A centred label over a left-aligned column reads as a misalignment, not a heading.
+            centered = section in (FAV, BPM, KEY, RB, LINKS, TIME, FORMAT, BITRATE, DATE)
+            return int(Qt.AlignCenter if centered else Qt.AlignLeft | Qt.AlignVCenter)
         return None
 
+    def tag_names(self, r):
+        return sorted(self.value_names[i] for i in r.value_ids if i in self.value_names and i != self.favorite_id)
+
     def tag_text(self, r):
-        names = sorted(self.value_names[i] for i in r.value_ids if i in self.value_names and i != self.favorite_id)
-        return ", ".join(names)
+        return ", ".join(self.tag_names(r))
 
     def data(self, index, role=Qt.DisplayRole):
         if not index.isValid():
@@ -107,13 +141,24 @@ class TrackModel(QAbstractTableModel):
         r, col = self.rows[index.row()], index.column()
         if role == PATH_ROLE:
             return r.path
+        if role == KEY_ROLE:
+            return r.key
+        if role == TAGS_ROLE:
+            return self.tag_names(r)
+        if role == LINKS_ROLE:
+            return len(self.links.get(r.path, ()))
+        if role == PLAYLISTS_ROLE:
+            return len(self.playlists.get(r.path, ()))
+        if role == RB_ROLE:
+            return r.in_rekordbox
+        if role == FAV_ROLE:
+            return self.favorite_id in r.value_ids
         if role == Qt.EditRole and col in (TITLE, ARTIST):
             return r.title if col == TITLE else r.artist
         if role in (Qt.DisplayRole, SORT_ROLE):
             sort = role == SORT_ROLE
             if col == FAV:
-                fav = self.favorite_id in r.value_ids
-                return int(fav) if sort else ("★" if fav else "")
+                return int(self.favorite_id in r.value_ids) if sort else ""
             if col == TITLE:
                 return r.title.lower() if sort else r.title
             if col == ARTIST:
@@ -123,14 +168,15 @@ class TrackModel(QAbstractTableModel):
                     return r.bpm or 0.0
                 return "" if not r.bpm else (f"{r.bpm:.0f}" if r.bpm == int(r.bpm) else f"{r.bpm:.1f}")
             if col == KEY:
-                return keys.sort_key(r.key) if sort else keys.display(r.key)
+                return keys.sort_key(r.key) if sort else ""  # drawn by KeyPillDelegate
             if col == RB:
-                return int(r.in_rekordbox) if sort else ("✓" if r.in_rekordbox else "not imported")
+                return int(r.in_rekordbox) if sort else ""  # drawn by MarkDelegate
             if col == TAGS:
-                return self.tag_text(r).lower() if sort else self.tag_text(r)
+                return self.tag_text(r).lower() if sort else ""  # drawn by TagChipDelegate
             if col == LINKS:
-                n = len(self.links.get(r.path, ()))
-                return n if sort else (f"🔗 {n}" if n else "")
+                return len(self.links.get(r.path, ())) if sort else ""  # drawn by MarkDelegate
+            if col == PLAYLISTS:
+                return len(self.playlists.get(r.path, ())) if sort else ""  # drawn by MarkDelegate
             if col == FOLDER:
                 return r.folder.lower() if sort else r.folder
             if col == TIME:
@@ -139,7 +185,11 @@ class TrackModel(QAbstractTableModel):
                 return r.ext.lstrip(".").upper()
             if col == BITRATE:
                 return (r.bitrate or 0) if sort else (f"{r.bitrate} kbps" if r.bitrate else "")
+            if col == DATE:
+                return (r.mtime or 0.0) if sort else fmt_date(r.mtime)
         if role == Qt.ToolTipRole:
+            if col == BPM and r.bpm_src == "detected":
+                return "BPM detected by beat_this: an estimate, with no beat grid behind it"
             if col == BPM and r.bpm_src:
                 return f"BPM from {r.bpm_src}"
             if col == KEY and r.key_src:
@@ -149,6 +199,13 @@ class TrackModel(QAbstractTableModel):
             if col == LINKS and self.links.get(r.path):
                 linked = sorted(self.rows[self._index[p]].title for p in self.links[r.path] if p in self._index)
                 return "Goes well with:\n" + "\n".join(f"• {t}" for t in linked[:15]) + "\n\n⇧⌘L shows them."
+            if col == PLAYLISTS and self.playlists.get(r.path):
+                names = sorted(self.playlist_names.get(i, "?") for i in self.playlists[r.path])
+                return "In these playlists:\n" + "\n".join(f"• {n}" for n in names[:15])
+            if col == DATE:
+                # The file's own date, not a library "date added": import copies it over (shutil.copystat),
+                # so a track keeps the date it had before it landed here.
+                return f"File modified {fmt_date(r.mtime)}" if r.mtime else r.path
             if col in (TITLE, ARTIST):
                 return f"{r.path}\n\nF2 edits the {'title' if col == TITLE else 'artist'} tag (the filename stays; " \
                     "Clean up names renames files)."
@@ -156,15 +213,14 @@ class TrackModel(QAbstractTableModel):
         if role == Qt.ForegroundRole:
             # Grey means "the file said so, rekordbox hasn't analysed it". With rekordbox off the file tag
             # is the only source there is, so greying every row would just say the library is unanalysed.
+            # A detected BPM is an estimate either way.
+            if col == BPM and r.bpm_src == "detected":
+                return theme.FILE_SOURCE
             if self.rekordbox and ((col == BPM and r.bpm_src == "file") or (col == KEY and r.key_src == "file")):
                 return theme.FILE_SOURCE
             if col == RB and not r.in_rekordbox:
                 return theme.WARN
-            if col == FAV:
-                return theme.FAV
-        if role == Qt.BackgroundRole and col == KEY:
-            return theme.key_color(r.key)
-        if role == Qt.TextAlignmentRole and col in (FAV, BPM, KEY, RB, LINKS, TIME, FORMAT, BITRATE):
+        if role == Qt.TextAlignmentRole and col in (FAV, BPM, KEY, RB, LINKS, PLAYLISTS, TIME, FORMAT, BITRATE, DATE):
             return int(Qt.AlignCenter)
         return None
 

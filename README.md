@@ -52,6 +52,24 @@ Under the search box: a **BPM** range (half and double tempo match too, so 70 fi
 and BPM ±6% (*View → BPM range for mixing…*). **⇧⌘K** clears every filter. Key cells are tinted by Camelot number,
 so neighbours on the wheel have neighbouring colours.
 
+## Detecting missing BPMs
+
+Tracks with no BPM from rekordbox or the file tag can get one from [beat_this](https://github.com/CPJKU/beat_this):
+**View → Detect missing BPMs…** for all of them, or `b` / right-click → *Detect BPM* for the selection. It's an
+optional extra, because it pulls in PyTorch (about 1 GB) and downloads an 80 MB model the first time:
+
+```sh
+.venv/bin/pip install -r requirements-analysis.txt
+```
+
+About 2 s per track on Apple Silicon, in the background (*View → Stop detecting BPM* keeps what's done).
+Detected values are **grey** and last in line: rekordbox's analysis, then the file tag, then detection. They stay
+in DJTools. They're never written to rekordbox or the files, because a tempo with no beat grid would be worse than
+none there. Tempos are folded into 70–180 (`bpm_detect_range` in settings.json), so drum & bass reads 174, not 87.
+Measured against the 73 file tags in this library: 50 exact, 5 within 1.5 BPM, 11 at half, double or 3:2 tempo (mostly
+DnB tagged at half-time), 6 wrong and 1 with no answer. On 60 untagged tracks, 1 had no steady beat to measure.
+Good for sorting; check by ear before you trust it in a mix.
+
 In **Filter by tags**, click a tag to cycle ✓ must have → exclude (struck through) → off, and switch between
 matching *all* or *any* ticked tag. The number after each tag counts the tracks carrying it in the current list.
 
@@ -69,6 +87,33 @@ unlinking.
 Links are a DJTools thing: they live in its cache on this Mac, not in rekordbox or on the stick. They follow tracks
 moved or renamed from DJTools. A file renamed elsewhere shows as *missing* in the Links window until you remove it.
 
+## Playlists rekordbox plays from
+
+**⌥⌘P** opens the Playlists window: rekordbox's own playlist tree, editable here. The left pane is the tree,
+the right pane is the set in order — drag a track, or **⌥↑ / ⌥↓**, to move it. **New playlist** adds one
+(inside the selected folder, if one is selected), **Add tracks…** ticks tracks from the whole library, and
+**Show in list** narrows the main list to the playlist.
+
+From the track list, **⌘P** (vim `P`) puts the selected tracks in a playlist — or in a new one — and **⇧⌘P**
+(vim `S`) narrows the list to a playlist the current track is in. The **Playlists** column counts the
+playlists a track is in; hover for their names.
+
+Nothing reaches rekordbox until you **Sync**, which lists the playlists it will create, rename, change or
+delete. A `•` next to a playlist's track count means rekordbox hasn't been told about it yet. Each sync also
+backs up `masterPlaylists6.xml` next to `master.db` — rekordbox needs both to show a playlist, so restore
+them as a pair.
+
+**Delete** puts a playlist in the trash at the bottom of the window: it is removed from rekordbox at the next
+sync but kept here, so **Restore** brings it back (with its order) and pushes it again. Only *Delete forever*
+destroys it, and that is the one thing **⌘Z** cannot undo — everything else in the window can be undone, including
+reordering. Folders and smart playlists are not deleted from here (DJTools couldn't bring them back); delete
+them in rekordbox.
+
+Tracks rekordbox doesn't know are left out of what it receives, and the sync says which — import them into
+rekordbox and sync again. Tracks DJTools can't reach (the stick unplugged, a file renamed elsewhere) show as
+*missing* but are still pushed: a set never shrinks because a drive was out. Playlist **folders** and rekordbox's
+**smart playlists** are shown but not edited here, and neither is the order of playlists within the tree.
+
 ## Tagging faster
 
 **⌘Z / ⇧⌘Z** undo and redo tag changes (ticks, ★, paste), until the next rescan, move or tag rename.
@@ -85,8 +130,10 @@ dropped folder keeps its name. Then import and analyze them in rekordbox and Res
 
 ## Layout
 
-Window size, pane sizes, column widths, order, sort and the volume are remembered. Right-click the column header
-to show or hide columns (Format and Bitrate are hidden by default). *View → Reset layout* goes back to the defaults.
+Window size, pane sizes, column widths, order, sort and the volume are remembered. Click a header to sort by it —
+**Date** is the file's own modification date, which an import preserves, so sorting by it groups your newest
+additions (click twice for newest first). Right-click the column header to show or hide columns (Format and
+Bitrate are hidden by default). *View → Reset layout* goes back to the defaults.
 
 Files: drag tracks onto a folder to move them (rekordbox's path follows at the next sync). Delete moves
 to the macOS Trash; rekordbox then lists the track as missing, remove it there.
@@ -111,7 +158,7 @@ Menus: `⌘F` search · `⌘R` rescan · `⌘I` import · `⌘K` tracks that mix
 `⌘C`/`⌘V` copy/paste tags · `⌘L` link · `⇧⌘L` linked tracks · `⌥⌘L` all links · `⌘/` all shortcuts.
 
 Vim keys: `j`/`k` (with counts), `gg`/`G`, `Ctrl-d`/`Ctrl-u`, `v` visual selection, `o` play, `h`/`l` seek,
-`dd`/`x` trash, `m` move, `/` search, `t` tags, `c` tracks that mix, `w`/`W` link / linked tracks, `u`/`Ctrl-r` undo/redo, `y`/`p` copy/paste
+`dd`/`x` trash, `m` move, `/` search, `t` tags, `c` tracks that mix, `b` detect BPM, `w`/`W` link / linked tracks, `u`/`Ctrl-r` undo/redo, `y`/`p` copy/paste
 tags, `i`/`a` edit title/artist, `Ctrl-h`/`Ctrl-l` switch panes. Press `?` for the full list.
 
 Testing against a copy of the database: `DJTOOLS_RB_DB=/path/to/copy/master.db ./run.sh`

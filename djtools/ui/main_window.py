@@ -2,11 +2,12 @@ import base64
 import os
 import subprocess
 
-from PySide6.QtCore import QByteArray, QDir, QItemSelectionModel, QMimeData, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QByteArray, QDir, QItemSelectionModel, QMimeData, QSize, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QAction, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QFileDialog,
+    QFileIconProvider,
     QFileSystemModel,
     QHBoxLayout,
     QHeaderView,
@@ -26,18 +27,20 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .. import rekordbox
+from .. import analysis, cache, rekordbox
 from ..health import INBOX
 from ..library import Library, import_files, scan
-from . import theme
+from . import delegates, icons, theme
 from .cleanup_dialog import CleanupDialog
 from .filter_bar import FilterBar
 from .health_panel import HealthPanel
 from .links import LinkPicker, LinksWindow, track_label
 from .player_bar import PlayerBar
+from .playlists import PlaylistsWindow
 from .tag_panel import TagPanel
 from .track_model import (
     ARTIST,
+    DATE,
     FAV,
     FOLDER,
     HEADERS,
@@ -45,7 +48,9 @@ from .track_model import (
     KEY,
     LINKS,
     PATH_ROLE,
+    PLAYLISTS,
     RB,
+    TAGS,
     TITLE,
     TrackFilter,
     TrackModel,
@@ -84,6 +89,26 @@ class ImportWorker(QThread):
     def run(self):
         imported, errors = import_files(self.sources, self.dest, self.root, lambda i, n: self.progress.emit(i, n))
         self.done.emit(imported, errors)
+
+
+class AnalyzeWorker(QThread):
+    progress = Signal(int, int)
+    done = Signal(int, int, list, str)  # stored, no steady beat, per-file errors, fatal (model didn't load)
+
+    def __init__(self, paths, bpm_range):
+        super().__init__()
+        self.paths, self.bpm_range = paths, bpm_range
+        self.stop = False
+
+    def run(self):
+        try:
+            stored, skipped, errors = analysis.analyze(
+                self.paths, self.bpm_range, lambda i, n: self.progress.emit(i, n), lambda: self.stop
+            )
+        except Exception as exc:
+            self.done.emit(0, 0, [], str(exc))
+            return
+        self.done.emit(stored, skipped, errors, "")
 
 
 def _dropped_files(mime):
@@ -141,10 +166,43 @@ class FolderTree(QTreeView):
             self.files_dropped.emit(files, dest)
 
 
+# Bumped whenever the default column widths change: a saved header state restores the old ones
+# silently, and the new defaults would never be seen.
+LAYOUT_VERSION = 4  # 4: the Date column (a restored 13-column header would never show it)
+
+
+class _FolderIcons(QFileIconProvider):
+    """One flat folder mark instead of the system's blue folders, which are the only saturated
+    colour in the app that does not mean a key."""
+
+    def icon(self, arg):
+        if isinstance(arg, QFileIconProvider.IconType) or arg.isDir():
+            return icons.icon("folder", theme.MUTED, 15)
+        return super().icon(arg)
+
+
 class TrackTable(QTableView):
     """The track list. Files dropped from Finder are copied into the library."""
 
     files_dropped = Signal(list)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.hover_row = -1  # read by ui/delegates.py; Qt has no row-level :hover
+        self.setMouseTracking(True)
+
+    def _hover(self, row):
+        if row != self.hover_row:
+            self.hover_row = row
+            self.viewport().update()
+
+    def mouseMoveEvent(self, event):
+        super().mouseMoveEvent(event)
+        self._hover(self.indexAt(event.position().toPoint()).row())
+
+    def leaveEvent(self, event):
+        super().leaveEvent(event)
+        self._hover(-1)
 
     def dragEnterEvent(self, event):
         if _dropped_files(event.mimeData()):
@@ -175,36 +233,47 @@ class MainWindow(QMainWindow):
         self.keymap.listeners.append(self._apply_menu_keys)
         self.worker = None
         self.import_worker = None
+        self.analyze_worker = None
         self.copied_tags = None  # value ids from "Copy tags"
         self.links_window = None
-        self.banner_kind = None  # what the banner's path filter is: "health" or "links"
+        self.playlists_window = None
+        self.banner_kind = None  # what the banner's path filter is: "health", "links" or "playlist"
         self.linked_source = None  # the track whose links are shown, while banner_kind == "links"
+        self.shown_playlist = None  # the playlist id shown, while banner_kind == "playlist"
 
         # Toolbar
         bar = QToolBar()
         bar.setMovable(False)
+        bar.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        bar.setIconSize(QSize(18, 18))
         self.addToolBar(bar)
-        choose = QAction("📁 Library folder…", self)
+        choose = QAction(icons.icon("folder"), "Library folder…", self)
         choose.triggered.connect(self.choose_root)
         bar.addAction(choose)
-        self.rescan_action = QAction("⟳ Rescan", self)
+        self.rescan_action = QAction(icons.icon("refresh"), "Rescan", self)
         self.rescan_action.setToolTip("Rescan files and re-read rekordbox (after importing or analyzing there)")
         self.rescan_action.triggered.connect(self.reload)
         bar.addAction(self.rescan_action)
-        cleanup = QAction("🧹 Clean up names…", self)
+        cleanup = QAction(icons.icon("sparkle"), "Clean up names…", self)
         cleanup.setToolTip("Preview and fix titles, artists and filenames that don't follow the library's rules")
         cleanup.triggered.connect(lambda: self.open_cleanup())
         bar.addAction(cleanup)
         bar.addSeparator()
-        self.sync_action = QAction("⇪ Sync to rekordbox", self)
+        self.sync_action = QAction(icons.icon("upload", theme.ACCENT), "Sync to rekordbox", self)
         self.sync_action.triggered.connect(self.sync)
         bar.addAction(self.sync_action)
+        # The one filled control in the app: syncing is the thing everything else leads to.
+        if button := bar.widgetForAction(self.sync_action):
+            button.setProperty("primary", True)
         self.rb_label = QLabel()
-        self.rb_label.setContentsMargins(12, 0, 0, 0)
+        self.rb_label.setFont(theme.font("caption"))
+        self.rb_label.setProperty("muted", True)
+        self.rb_label.setContentsMargins(theme.SPACE * 2, 0, 0, 0)
         bar.addWidget(self.rb_label)
 
         # Left: folders
         self.fs_model = QFileSystemModel(self)
+        self.fs_model.setIconProvider(_FolderIcons())
         self.fs_model.setFilter(QDir.AllDirs | QDir.NoDotAndDotDot)
         self.fs_model.setReadOnly(True)  # all moves go through the library so rekordbox paths follow
         self.tree = FolderTree()
@@ -223,7 +292,8 @@ class MainWindow(QMainWindow):
         new_folder_btn.clicked.connect(lambda: self.new_folder(self._current_folder()))
         left = QWidget()
         left_layout = QVBoxLayout(left)
-        left_layout.setContentsMargins(4, 4, 0, 4)
+        left_layout.setContentsMargins(theme.SPACE, theme.SPACE, 0, theme.SPACE)
+        left_layout.setSpacing(theme.SPACE)
         left_layout.addWidget(all_btn)
         left_layout.addWidget(self.tree, 1)
         left_layout.addWidget(new_folder_btn)
@@ -253,13 +323,18 @@ class MainWindow(QMainWindow):
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)  # F2 / menu; double-click plays
         self.table.files_dropped.connect(lambda files: self.import_into(files, self._import_destination()))
         self.table.verticalHeader().hide()
-        self.table.verticalHeader().setDefaultSectionSize(24)
-        self.table.setAlternatingRowColors(True)
+        self.table.verticalHeader().setDefaultSectionSize(theme.ROW_HEIGHT)
+        self.table.setAlternatingRowColors(False)  # the delegate draws the row; two treatments fight
+        self.table.setShowGrid(False)
         self.table.setWordWrap(False)
+        self.table.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+        delegates.install(self.table)
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.Interactive)
         header.setStretchLastSection(False)
-        for col, width in ((FAV, 30), (TITLE, 320), (1 + TITLE, 200), (KEY, 90), (RB, 95), (LINKS, 60), (FOLDER, 180)):
+        for col, width in ((FAV, 34), (TITLE, 320), (1 + TITLE, 200), (KEY, 104), (RB, 95),
+                          (TAGS, 190), (LINKS, 64), (PLAYLISTS, 74), (FOLDER, 180), (DATE, 100)):
             self.table.setColumnWidth(col, width)
         for col in HIDDEN_BY_DEFAULT:
             self.table.hideColumn(col)
@@ -275,11 +350,15 @@ class MainWindow(QMainWindow):
         self.search.setPlaceholderText("Search title, artist, key (8A), tag, folder…")
         self.search.setClearButtonEnabled(True)
         self.search.textChanged.connect(lambda t: self._filter(text=t))
-        self.fav_btn = QPushButton("★ Favorites")
+        self.fav_btn = QPushButton(icons.icon("star"), " Favorites")
         self.fav_btn.setCheckable(True)
         self.fav_btn.toggled.connect(lambda on: self._filter(only_favorites=on))
         self.count_label = QLabel()
+        self.count_label.setFont(theme.font("caption", tabular=True))
+        self.count_label.setProperty("muted", True)
         top = QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 0)
+        top.setSpacing(theme.SPACE)
         top.addWidget(self.search, 1)
         top.addWidget(self.fav_btn)
         top.addWidget(self.count_label)
@@ -288,7 +367,8 @@ class MainWindow(QMainWindow):
         self.filters.clear_all.connect(self.clear_filters)
         center = QWidget()
         center_layout = QVBoxLayout(center)
-        center_layout.setContentsMargins(0, 4, 0, 4)
+        center_layout.setContentsMargins(0, theme.SPACE, 0, theme.SPACE)
+        center_layout.setSpacing(theme.SPACE)
         center_layout.addLayout(top)
         center_layout.addWidget(self.filters)
         self.banner = QWidget()
@@ -297,7 +377,7 @@ class MainWindow(QMainWindow):
         banner_all = QPushButton("Show all")
         banner_all.clicked.connect(self._clear_check)
         banner_layout = QHBoxLayout(self.banner)
-        banner_layout.setContentsMargins(8, 2, 2, 2)
+        banner_layout.setContentsMargins(theme.SPACE + 4, 4, 4, 4)
         banner_layout.addWidget(self.banner_label, 1)
         banner_layout.addWidget(banner_all)
         self.banner.hide()
@@ -332,18 +412,23 @@ class MainWindow(QMainWindow):
         root_layout.addWidget(self.player)
         self.setCentralWidget(root)
 
-        # Keys (scoped to the table so typing in search isn't hijacked)
-        for seq, handler in (
-            (Qt.Key_Space, self.player.toggle),
-            (Qt.Key_Return, lambda: self._play_index(self.table.currentIndex())),
-            (QKeySequence.Delete, self.trash_selected),
-            (Qt.Key_Backspace, self.trash_selected),
-            (Qt.Key_F2, lambda: self.edit_cell(TITLE)),
-            (Qt.Key_Left, lambda: self.player.seek_by(-10000)),
-            (Qt.Key_Right, lambda: self.player.seek_by(10000)),
+        # Keys (scoped to the table so typing in search isn't hijacked).
+        # `repeat` is off for everything but seeking. Committing a title edit with Return closes the
+        # editor and hands focus back to the table *while the key is still down*, so the next
+        # auto-repeat arrives at the table and plays the track the user was only renaming. Holding
+        # Backspace walking down the list trashing tracks is the same bug with worse consequences.
+        for seq, handler, repeat in (
+            (Qt.Key_Space, self.player.toggle, False),
+            (Qt.Key_Return, lambda: self._play_index(self.table.currentIndex()), False),
+            (QKeySequence.Delete, self.trash_selected, False),
+            (Qt.Key_Backspace, self.trash_selected, False),
+            (Qt.Key_F2, lambda: self.edit_cell(TITLE), False),
+            (Qt.Key_Left, lambda: self.player.seek_by(-10000), True),
+            (Qt.Key_Right, lambda: self.player.seek_by(10000), True),
         ):
             shortcut = QShortcut(QKeySequence(seq), self.table)
             shortcut.setContext(Qt.WidgetShortcut)
+            shortcut.setAutoRepeat(repeat)
             shortcut.activated.connect(handler)
 
         self.vim = VimKeys(self)
@@ -379,8 +464,11 @@ class MainWindow(QMainWindow):
         self.tree.setRootIndex(self.fs_model.index(self.library.root))
         self.proxy.update(folder=None)
 
+    def _busy(self):
+        return any(w is not None and w.isRunning() for w in (self.worker, self.import_worker, self.analyze_worker))
+
     def reload(self):
-        if self.worker is not None and self.worker.isRunning():
+        if self._busy():
             return
         self.rescan_action.setEnabled(False)
         self.sync_action.setEnabled(False)
@@ -432,11 +520,14 @@ class MainWindow(QMainWindow):
             )
         QMessageBox.information(self, "Tags made without rekordbox", text)
 
-    def _rebuild(self):
-        self.library.clear_undo()  # paths or tag definitions may have changed under the recorded steps
+    def _rebuild(self, keep_undo=False):
+        if not keep_undo:
+            self.library.clear_undo()  # paths or tag definitions may have changed under the recorded steps
         selected = set(self._selected_paths())
         values = self.library.cache.values()
         self.model.links = self.library.link_map()
+        self.model.playlists = self.library.playlist_map()
+        self.model.playlist_names = {p["id"]: p["name"] for p in self.library.playlists()}
         self.model.rekordbox = self.library.rekordbox_enabled
         self.model.set_data(self.library.rows(), {v["id"]: v["name"] for v in values}, self._favorite_id(create=False))
         self.tags.rebuild()
@@ -444,6 +535,8 @@ class MainWindow(QMainWindow):
         self._restore_selection(selected)
         if self.links_window is not None:
             self.links_window.refresh()
+        if self.playlists_window is not None:
+            self.playlists_window.refresh()
         self._update_status()
 
     def _favorite_id(self, create):
@@ -498,7 +591,7 @@ class MainWindow(QMainWindow):
     def _update_status(self):
         changes, waiting = self.library.pending_counts()
         running = self.rb_running
-        self.sync_action.setText(f"⇪ Sync to rekordbox ({changes})" if changes else "⇪ Sync to rekordbox")
+        self.sync_action.setText(f"Sync to rekordbox ({changes})" if changes else "Sync to rekordbox")
         self.sync_action.setEnabled(bool(changes) and self.library.rb_state is not None)
         parts = []
         if not self.library.rekordbox_enabled:
@@ -526,7 +619,7 @@ class MainWindow(QMainWindow):
         if current.isValid():
             if self.proxy.paths is not None:  # a folder click replaces the health filter rather than combining
                 self.banner.hide()
-                self.banner_kind = self.linked_source = None
+                self.banner_kind = self.linked_source = self.shown_playlist = None
                 self.health.clear_selection()
                 self.proxy.update(paths=None)
             self._filter(folder=self.fs_model.filePath(current))
@@ -592,7 +685,7 @@ class MainWindow(QMainWindow):
 
     def _clear_check(self):
         self.banner.hide()
-        self.banner_kind = self.linked_source = None
+        self.banner_kind = self.linked_source = self.shown_playlist = None
         self.health.clear_selection()
         self._filter(paths=None)
 
@@ -639,7 +732,7 @@ class MainWindow(QMainWindow):
             return
         row = self.model.row_for(index.data(PATH_ROLE))
         if row:
-            self.player.play(row.path, f"{row.artist} – {row.title}" if row.artist else row.title)
+            self.player.play(row.path, row.title, row.artist)
 
     def _cell_clicked(self, index):
         if index.column() == FAV:
@@ -656,7 +749,7 @@ class MainWindow(QMainWindow):
         fav = self._favorite_id(create=True)
         if fav is None:
             QMessageBox.information(
-                self, "Favorites", "Name one of the My Tag columns “Favorite” (✎ in the tag panel) to use ★."
+                self, "Favorites", "Rename one of the tag columns to “Favorite” (the pencil in the tag panel) to use it."
             )
             return
         tag_map = self.library.cache.track_tag_map()
@@ -679,13 +772,15 @@ class MainWindow(QMainWindow):
         self.tags.refresh_states()
         self._tags_edited()
         self._links_edited()
+        self._playlists_edited()
         self._message(message, 4000)
 
     def _message(self, text, ms):
-        """Status bar, and the Links window's own line while it's open (it hides the status bar)."""
+        """Status bar, and the other windows' own line while one is open (they hide the status bar)."""
         self.statusBar().showMessage(text, ms)
-        if self.links_window is not None and self.links_window.isVisible():
-            self.links_window.show_message(text)
+        for window in (self.links_window, self.playlists_window):
+            if window is not None and window.isVisible():
+                window.show_message(text)
 
     def copy_tags(self):
         row = self.model.row_for(self.table.currentIndex().data(PATH_ROLE)) if self.table.currentIndex().isValid() else None
@@ -830,7 +925,7 @@ class MainWindow(QMainWindow):
     def play_path(self, path):
         row = self.model.row_for(path)
         if row:
-            self.player.play(row.path, track_label(row))
+            self.player.play(row.path, row.title, row.artist)
 
     def open_links(self):
         if self.links_window is None:
@@ -849,6 +944,92 @@ class MainWindow(QMainWindow):
         self.links_window.show()
         self.links_window.raise_()
         self.links_window.activateWindow()
+
+    def open_playlists(self):
+        if self.playlists_window is None:
+            self.playlists_window = PlaylistsWindow(self.library, self.model, self)
+            self.playlists_window.jump_requested.connect(self.select_track)
+            self.playlists_window.play_requested.connect(self.play_path)
+            self.playlists_window.show_playlist.connect(self._show_playlist)
+            self.playlists_window.edited.connect(self._playlists_edited)
+            self.playlists_window.undo_requested.connect(self.undo)
+            self.playlists_window.redo_requested.connect(self.redo)
+        else:
+            self.playlists_window.refresh()
+        self.playlists_window.show()
+        self.playlists_window.raise_()
+        self.playlists_window.activateWindow()
+
+    def _playlists_edited(self):
+        """Cheap path after a playlist edit: repaint the column, leave the rows and the filter alone."""
+        self.model.set_playlists(
+            self.library.playlist_map(), {p["id"]: p["name"] for p in self.library.playlists()}
+        )
+        if self.banner_kind == "playlist" and self.shown_playlist is not None:
+            shown = self._playlist_filter(self.shown_playlist)
+            if shown is None:  # trashed or purged while shown
+                self._clear_check()
+            else:
+                self.proxy.update(paths=shown[0])
+                self.banner_label.setText(shown[1])
+        if self.playlists_window is not None and not self.playlists_window.isActiveWindow():
+            self.playlists_window.refresh()
+        self._update_status()
+
+    def _pick_playlist(self, title):
+        """Choose one editable playlist, with "New playlist…" first. Returns its id, or None."""
+        rows = [p for p in self.library.playlists() if p["kind"] == cache.PLAYLIST]
+        names = ["New playlist…"] + [p["name"] for p in rows]
+        name, ok = QInputDialog.getItem(self, title, "Playlist:", names, 0, False)
+        if not ok:
+            return None
+        if name == "New playlist…":
+            new_name, ok = QInputDialog.getText(self, "New playlist", "Name of the new playlist:")
+            return self.library.create_playlist(new_name.strip()) if ok and new_name.strip() else None
+        return next(p["id"] for p in rows if p["name"] == name)
+
+    def add_to_playlist_dialog(self):
+        """Put the selected tracks in a playlist."""
+        paths = self._selected_paths()
+        if not paths:
+            self.statusBar().showMessage("Select the tracks to add first.", 6000)
+            return
+        playlist_id = self._pick_playlist(f"Add {len(paths)} track{'s' * (len(paths) != 1)} to a playlist")
+        if playlist_id is None:
+            return
+        added = self.library.add_to_playlist(playlist_id, paths)
+        name = self.library.playlist(playlist_id)["name"]
+        self._playlists_edited()
+        if self.playlists_window is not None:
+            self.playlists_window.refresh()
+        self._message(
+            f"Added {added} track{'s' * (added != 1)} to {name}. ⌘Z undoes it." if added
+            else f"Already in {name}.", 6000,
+        )
+
+    def show_playlists(self, path=None):
+        """Narrow the list to a playlist the current track is in."""
+        row = self.model.row_for(path) if path else self._current_row()
+        if row is None:
+            return
+        ids = self.library.playlist_map().get(row.path, set())
+        names = {p["id"]: p["name"] for p in self.library.playlists()}
+        ids = sorted((i for i in ids if i in names), key=lambda i: names[i].lower())
+        if not ids:
+            self.statusBar().showMessage(
+                f"{track_label(row)} isn't in any playlist yet: ⇧P adds it to one.", 6000
+            )
+            return
+        playlist_id = ids[0]
+        if len(ids) > 1:
+            name, ok = QInputDialog.getItem(
+                self, "Show a playlist", "This track is in:", [names[i] for i in ids], 0, False
+            )
+            if not ok:
+                return
+            playlist_id = next(i for i in ids if names[i] == name)
+        self._show_playlist(playlist_id)
+        self.select_track(row.path)
 
     def _links_edited(self):
         links = self.library.link_map()
@@ -909,10 +1090,8 @@ class MainWindow(QMainWindow):
     def import_into(self, files, dest):
         if not files or not dest or not self._library_available("Import"):
             return
-        if (self.worker is not None and self.worker.isRunning()) or (
-            self.import_worker is not None and self.import_worker.isRunning()
-        ):
-            self.statusBar().showMessage("Busy scanning or importing; try again in a moment.", 5000)
+        if self._busy():
+            self.statusBar().showMessage("Busy scanning, importing or detecting BPM; try again in a moment.", 5000)
             return
         if not self.library.contains(dest):
             return
@@ -934,6 +1113,73 @@ class MainWindow(QMainWindow):
         )
         if errors:
             QMessageBox.warning(self, "Import", "\n".join(errors[:20]) + ("\n…" if len(errors) > 20 else ""))
+
+    # --- BPM detection -----------------------------------------------------------------------------
+
+    def detect_bpm_selected(self):
+        self.detect_bpm(self._selected_paths())
+
+    def detect_missing_bpm(self):
+        paths = [r.path for r in self.model.rows if not r.bpm and r.readable]
+        if not paths:
+            self.statusBar().showMessage("Every track already has a BPM.", 5000)
+            return
+        answer = QMessageBox.question(
+            self, "Detect missing BPMs",
+            f"Detect the BPM of {len(paths)} track{'s' * (len(paths) != 1)} with no BPM from rekordbox or the file?"
+            "\n\nIt takes a few seconds per track and runs in the background. Detected values are shown in grey, "
+            "stay in DJTools and are never written to rekordbox or the files.",
+        )
+        if answer == QMessageBox.Yes:
+            self.detect_bpm(paths)
+
+    def detect_bpm(self, paths):
+        if not paths or not self._library_available("Detect BPM"):
+            return
+        ok, why = analysis.available()
+        if not ok:
+            QMessageBox.information(
+                self, "Detect BPM",
+                "BPM detection needs beat_this (and PyTorch, about 1 GB), which isn't installed.\n\n"
+                f"In the DJTools folder, run:\n\n    {analysis.INSTALL_HINT}\n\nthen restart the app.\n\n({why})",
+            )
+            return
+        if self._busy():
+            self.statusBar().showMessage("Busy scanning, importing or detecting BPM; try again in a moment.", 5000)
+            return
+        self.progress.setRange(0, 0)
+        self.progress.show()
+        self.stop_bpm_action.setEnabled(True)
+        self.statusBar().showMessage("Loading the BPM model (the first time downloads about 80 MB)…")
+        bpm_range = tuple(self.settings.get("bpm_detect_range", analysis.DEFAULT_RANGE))
+        self.analyze_worker = AnalyzeWorker(paths, bpm_range)
+        self.analyze_worker.progress.connect(self._detect_progress)
+        self.analyze_worker.done.connect(self._bpm_detected)
+        self.analyze_worker.start()
+
+    def _detect_progress(self, i, n):
+        self._scan_progress(i, n)
+        self.statusBar().showMessage(f"Detecting BPM… {i + 1} / {n}")
+
+    def stop_detecting_bpm(self):
+        if self.analyze_worker is not None and self.analyze_worker.isRunning():
+            self.analyze_worker.stop = True
+            self.statusBar().showMessage("Stopping after the current track…")
+
+    def _bpm_detected(self, stored, skipped, errors, fatal):
+        self.progress.hide()
+        self.stop_bpm_action.setEnabled(False)
+        if fatal:
+            QMessageBox.warning(self, "Detect BPM", f"The BPM model couldn't be loaded:\n\n{fatal}")
+            return
+        self._rebuild(keep_undo=True)  # only BPMs changed: paths and tag definitions are as they were
+        self.statusBar().showMessage(
+            f"BPM detected for {stored} track{'s' * (stored != 1)}"
+            + (f"; {skipped} had no steady beat" if skipped else "")
+            + (f"; {len(errors)} couldn't be read." if errors else "."), 15000
+        )
+        if errors:
+            QMessageBox.warning(self, "Detect BPM", "\n".join(errors[:20]) + ("\n…" if len(errors) > 20 else ""))
 
     def _library_available(self, title):
         if self.library.root and os.path.isdir(self.library.root):
@@ -1017,11 +1263,14 @@ class MainWindow(QMainWindow):
         if not paths:
             return
         menu = QMenu(self)
-        menu.addAction("▶ Play", lambda: self._play_index(self.table.currentIndex()))
-        menu.addAction("★ Toggle favorite  (F)", self.toggle_favorite)
+        menu.addAction(icons.icon("play"), "Play", lambda: self._play_index(self.table.currentIndex()))
+        menu.addAction(icons.icon("star"), "Toggle favorite  (F)", self.toggle_favorite)
         menu.addAction("Show tracks that mix with this one  (⌘K)", self.show_compatible)
+        menu.addAction(f"Detect BPM  ({self.keymap['detect_bpm']})", self.detect_bpm_selected)
         menu.addSeparator()
         self._link_menu(menu, paths)
+        menu.addSeparator()
+        self._playlist_menu(menu, paths)
         menu.addSeparator()
         menu.addAction("Edit title  (F2)", lambda: self.edit_cell(TITLE))
         menu.addAction("Edit artist", lambda: self.edit_cell(ARTIST))
@@ -1035,18 +1284,64 @@ class MainWindow(QMainWindow):
         menu.addAction(f"Move {len(paths)} to Trash…  (⌫)", self.trash_selected)
         menu.exec(self.table.viewport().mapToGlobal(pos))
 
+    def _playlist_menu(self, menu, paths):
+        menu.addAction(
+            icons.icon("folder"), f"Add {len(paths)} to a playlist…  (⌘P)" if len(paths) > 1
+            else "Add to a playlist…  (⌘P)", self.add_to_playlist_dialog,
+        )
+        current = self._current_row()
+        names = {p["id"]: p["name"] for p in self.library.playlists()}
+        in_playlists = sorted(
+            (i for i in self.library.playlist_map().get(current.path, set()) if i in names),
+            key=lambda i: names[i].lower(),
+        ) if current else []
+        if not in_playlists:
+            return
+        sub = menu.addMenu(f"In playlists ({len(in_playlists)})")
+        for playlist_id in in_playlists:
+            entry = sub.addMenu(names[playlist_id])
+            entry.addAction("Show it in the list  (⇧⌘P)", lambda i=playlist_id: self._show_playlist(i))
+            entry.addAction("Open the Playlists window", self.open_playlists)
+            entry.addAction(
+                "Take this track out of it",
+                lambda i=playlist_id, path=current.path: self._remove_from_playlist(i, path),
+            )
+
+    def _playlist_filter(self, playlist_id):
+        """(the playlist's tracks that are in the list, the banner text), or None if it's gone or trashed."""
+        row = self.library.playlist(playlist_id)
+        if row is None or row["deleted"]:
+            return None
+        paths = {p for p in self.library.playlist_paths(playlist_id) if self.model.row_for(p)}
+        return paths, f"Playlist: <b>{row['name']}</b> ({len(paths)})"
+
+    def _show_playlist(self, playlist_id):
+        shown = self._playlist_filter(playlist_id)
+        if shown is None:
+            return
+        self._show_paths(*shown, "playlist")
+        self.shown_playlist = playlist_id
+
+    def _remove_from_playlist(self, playlist_id, path):
+        name = self.library.playlist(playlist_id)["name"]
+        if self.library.remove_from_playlist(playlist_id, [path]):
+            self._playlists_edited()
+            if self.playlists_window is not None:
+                self.playlists_window.refresh()
+            self._message(f"Took it out of {name}. ⌘Z puts it back.", 6000)
+
     def _link_menu(self, menu, paths):
         if len(paths) >= 2:
-            menu.addAction(f"🔗 Link these {len(paths)} together  (⌘L)", self.link_tracks)
+            menu.addAction(icons.icon("link"), f"Link these {len(paths)} together  (⌘L)", self.link_tracks)
         else:
-            menu.addAction("🔗 Goes well with…  (⌘L)", self.link_tracks)
+            menu.addAction(icons.icon("link"), "Goes well with…  (⌘L)", self.link_tracks)
         playing = self.player.path
         if playing and any(p != playing for p in paths):
             row = self.model.row_for(playing)
             name = track_label(row) if row else os.path.basename(playing)
             if len(name) > 40:
                 name = name[:39] + "…"
-            menu.addAction(f"🔗 Goes well with the playing track: {name}", self.link_with_playing)
+            menu.addAction(icons.icon("link"), f"Goes well with the playing track: {name}", self.link_with_playing)
         current = self._current_row()
         linked = self.library.link_map().get(current.path, set()) if current else set()
         if not linked:
@@ -1098,6 +1393,17 @@ class MainWindow(QMainWindow):
             text += "\n\nRenamed in rekordbox's My Tags:\n" + "\n".join(lines)
         if pending["new_values"]:
             text += "\n\nNew My Tags: " + ", ".join(name for _, _, name in pending["new_values"])
+        pl_names = {p["id"]: p["name"] for p in self.library.playlists()}
+        trashed = {p["rb_id"]: p["name"] for p in self.library.trashed_playlists()}
+        pl_lines = [f"  New: {name}" for _local_id, _parent, name in pending["playlist_creates"]]
+        pl_lines += [f"  Renamed: {name}" for _rb_id, name in pending["playlist_renames"]]
+        pl_lines += [
+            f"  Tracks changed: {pl_names.get(local_id, '?')} ({len(entries)})"
+            for local_id, entries in pending["playlist_members"].items()
+        ]
+        pl_lines += [f"  Deleted: {trashed.get(rb_id, '?')}" for rb_id in pending["playlist_deletes"]]
+        if pl_lines:
+            text += "\n\nPlaylists:\n" + "\n".join(pl_lines)
         if waiting:
             text += f"\n\n{waiting} tagged tracks aren't in rekordbox yet; their tags stay here until you import them."
         if QMessageBox.question(self, "Sync to rekordbox", text) != QMessageBox.Yes:
@@ -1114,6 +1420,16 @@ class MainWindow(QMainWindow):
             msg += f", updated {result.moves_applied} moved paths"
         msg += f". Backup: {result.backup_path.name}"
         self.statusBar().showMessage(msg, 15000)
+        if result.playlist_drops:
+            dropped = "\n".join(
+                f"• {pl_names.get(local_id, '?')}: {len(paths)} track{'s' * (len(paths) != 1)}"
+                for local_id, paths in result.playlist_drops.items()
+            )
+            QMessageBox.warning(
+                self, "Sync to rekordbox",
+                "Some playlist tracks aren't in rekordbox, so they were left out of the playlists it got:\n\n"
+                + dropped + "\n\nImport them into rekordbox and sync again to put them back.",
+            )
         if result.anlz_errors:
             QMessageBox.warning(
                 self, "Sync to rekordbox", "Database updated, but some analysis files couldn't be rewritten:\n\n"
@@ -1172,6 +1488,11 @@ class MainWindow(QMainWindow):
             "One track: pick what it goes well with. Several: link them all together.",
         )
         self._action(edit, "Goes well with the playing track", self.link_with_playing)
+        edit.addSeparator()
+        self._action(
+            edit, "Add to playlist…", self.add_to_playlist_dialog, "m_add_playlist",
+            "Put the selected tracks in a playlist rekordbox will see",
+        )
         for action in (self.undo_action, self.redo_action):
             action.setEnabled(False)
 
@@ -1179,10 +1500,19 @@ class MainWindow(QMainWindow):
         self._action(view, "Search", lambda: (self.search.setFocus(), self.search.selectAll()), "m_search")
         self._action(view, "Show tracks that mix with this one", self.show_compatible, "m_compatible")
         self._action(view, "BPM range for mixing…", self.set_bpm_range)
+        view.addSeparator()
+        self._action(view, "Detect BPM of selection", self.detect_bpm_selected)
+        self._action(view, "Detect missing BPMs…", self.detect_missing_bpm)
+        self.stop_bpm_action = self._action(view, "Stop detecting BPM", self.stop_detecting_bpm)
+        self.stop_bpm_action.setEnabled(False)
+        view.addSeparator()
         self._action(view, "Clear filters", self.clear_filters, "m_clear_filters")
         view.addSeparator()
         self._action(view, "Show linked tracks", self.show_linked, "m_show_linked")
         self._action(view, "All links…", self.open_links, "m_all_links")
+        view.addSeparator()
+        self._action(view, "Show a playlist this track is in", self.show_playlists, "m_show_playlist")
+        self._action(view, "All playlists…", self.open_playlists, "m_playlists")
         view.addSeparator()
         columns = view.addMenu("Columns")
         columns.aboutToShow.connect(lambda: self._fill_column_menu(columns))
@@ -1199,7 +1529,7 @@ class MainWindow(QMainWindow):
         for col, name in enumerate(HEADERS):
             if col == TITLE or (col == RB and not self.library.rekordbox_enabled):
                 continue
-            action = menu.addAction("★ Favorite" if col == FAV else name)
+            action = menu.addAction("Favorite" if col == FAV else name)
             action.setCheckable(True)
             action.setChecked(not self.table.isColumnHidden(col))
             action.toggled.connect(lambda on, c=col: self.table.setColumnHidden(c, not on))
@@ -1212,7 +1542,7 @@ class MainWindow(QMainWindow):
     def _restore_layout(self):
         layout = self.settings.get("layout") or {}
         try:
-            if layout.get("columns") == len(HEADERS) and layout.get("header"):
+            if layout.get("version") == LAYOUT_VERSION and layout.get("header"):
                 header = self.table.horizontalHeader()
                 if header.restoreState(QByteArray(base64.b64decode(layout["header"]))):
                     self.table.sortByColumn(header.sortIndicatorSection(), header.sortIndicatorOrder())
@@ -1227,7 +1557,7 @@ class MainWindow(QMainWindow):
     def _save_layout(self):
         encode = lambda data: base64.b64encode(bytes(data)).decode()  # noqa: E731
         self.settings.set("layout", {
-            "columns": len(HEADERS),
+            "version": LAYOUT_VERSION,
             "header": encode(self.table.horizontalHeader().saveState()),
             "geometry": encode(self.saveGeometry()),
             "splitter": encode(self.splitter.saveState()),
@@ -1243,7 +1573,9 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         if not getattr(self, "_layout_reset", False):
             self._save_layout()
-        for worker in (self.worker, self.import_worker):
+        if self.analyze_worker is not None:
+            self.analyze_worker.stop = True
+        for worker in (self.worker, self.import_worker, self.analyze_worker):
             if worker is not None:
                 worker.wait(5000)
         super().closeEvent(event)
